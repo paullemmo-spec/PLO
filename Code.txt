@@ -1,0 +1,926 @@
+/**
+ * PLO BUDGET APP: Google Sheets web app
+ * ------------------------------------------------------------------
+ * Lives inside "Paul & Flo Running Sheet". Flo opens a link on her
+ * iPhone (no Google account, no Claude) and every spend she adds is
+ * written straight into the sheet, in the same style you use by hand:
+ *
+ *   • the spend goes in today's row, in the column she picks
+ *       (Expenses / Misc Spendings / Groceries / Petrol / Income …)
+ *   • a second spend that day turns the cell into  =SUM(70+45.26)
+ *   • the note column gets  " / Coles (45.26)"   (repeats merge: Fitstop (54+54))
+ *   • the cell keeps your "$"#,##0.00 formatting; Running Total formulas are never touched
+ *
+ * Tabs without Day/Date/Running Total columns (e.g. Houses) work as
+ * simple lists: add/edit rows, with formatting copied from the row above.
+ *
+ * SETUP (one time, about 5 minutes):
+ *  1. In the sheet: Extensions > Apps Script.
+ *  2. Replace everything in Code.gs with this file.
+ *  3. Click + > HTML, name it exactly  Index  and paste in Index.html.
+ *  4. (Optional) Choose  setup  in the function list and press Run. Approve the prompt.
+ *     The "App Settings" tab is also created automatically the first time the app opens.
+ *  5. Deploy > New deployment > Web app.
+ *        Execute as: Me      Who has access: Anyone
+ *     Deploy, then copy the Web app URL.
+ *  6. Send Flo the link. On her iPhone: open in Safari > Share > Add to Home Screen.
+ *     No PIN: the first time, each phone just picks who is using it.
+ *
+ * KEEP THE LINK PRIVATE: anyone with it can open the app. To stop it working,
+ * Deploy > Manage deployments > Archive (and make a new deployment later).
+ * Show or hide sheets: in the app, gear > Settings > Sheets in the app
+ * (or tick/untick them under "Tabs the app can see" in App Settings).
+ *
+ * After editing this code: Deploy > Manage deployments > Edit (pencil) >
+ * Version: New version > Deploy. The link stays the same.
+ */
+
+const SETTINGS_SHEET = 'App Settings';
+const TAB_HEADER_ROW = 15;      // row in App Settings where the tab table starts
+const DAYS_BACK = 100000;       // full load: ALL history (every day row in the tab)
+const DAYS_AHEAD = 100000;      // full load: ALL upcoming (pre-filled) days too, for Look ahead
+const QUICK_BACK = 120;         // quick first load: ~4 months back...
+const QUICK_AHEAD = 260;        // ...and ~8 months ahead. The rest loads quietly straight after.
+const MAX_LIST_ROWS = 800;
+
+const KEYS = {
+  access:      'Partner access ON',
+  canEdit:     'Partner can edit entries',
+  canDelete:   'Partner can delete list rows',
+  partnerPin:  'Partner PIN',
+  ownerPin:    'Owner PIN',
+  partnerName: 'Partner name',
+  ownerName:   'Your name',
+  appName:     'App name'
+};
+
+/* =============================== ENTRY =============================== */
+
+function doGet(e) {
+  // Opens fast: no sheet reading here. It hands the page who is using it (from the link),
+  // their saved look, and the last loaded figures (kept for a few hours), so the first screen
+  // shows straight away and fresh figures follow a moment later.
+  const prop = PropertiesService.getScriptProperties();
+  const u = String((e && e.parameter && e.parameter.u) || '').toLowerCase();
+  const who = u === 'owner' || u === 'paul' ? 'owner' : (u === 'partner' || u === 'flo' ? 'partner' : '');
+  let prefs = {};
+  try { if (who) prefs = JSON.parse(prop.getProperty('prefs_' + who) || '{}'); } catch (err) {}
+  let url = '';
+  try { url = ScriptApp.getService().getUrl(); } catch (err) {}
+  const boot = { who: who, prefs: prefs, url: url, data: cacheGet_('quick') };
+  const t = HtmlService.createTemplateFromFile('Index');
+  t.boot = JSON.stringify(boot).replace(/</g, '\\u003c').replace(/\u2028/g, '\\u2028').replace(/\u2029/g, '\\u2029');
+  return t.evaluate()
+    .setTitle(prop.getProperty('appName') || 'PLO')
+    .addMetaTag('viewport', 'width=device-width, initial-scale=1, maximum-scale=1, viewport-fit=cover')
+    .addMetaTag('apple-mobile-web-app-capable', 'yes')
+    .addMetaTag('mobile-web-app-capable', 'yes');   // only Google's allowed meta tags (title comes from setTitle)
+}
+
+/** Any edit typed straight into the sheet clears the saved copy, so the app never opens on old figures. */
+function onEdit() {
+  try { CacheService.getScriptCache().remove('quick_n'); } catch (e) {}
+}
+
+/* Last loaded figures, kept in Google's cache (split into pieces, it holds 100KB per piece). */
+function cachePut_(key, obj) {
+  try {
+    const c = CacheService.getScriptCache(), str = JSON.stringify(obj), size = 90000, n = Math.ceil(str.length / size);
+    if (n > 40) return;
+    const m = { [key + '_n']: String(n) };
+    for (let i = 0; i < n; i++) m[key + '_' + i] = str.slice(i * size, (i + 1) * size);
+    c.putAll(m, 21600);
+  } catch (e) {}
+}
+function cacheGet_(key) {
+  try {
+    const c = CacheService.getScriptCache(), n = parseInt(c.get(key + '_n'), 10);
+    if (!n) return null;
+    const keys = []; for (let i = 0; i < n; i++) keys.push(key + '_' + i);
+    const got = c.getAll(keys); let str = '';
+    for (let i = 0; i < n; i++) { if (got[keys[i]] == null) return null; str += got[keys[i]]; }
+    return JSON.parse(str);
+  } catch (e) { return null; }
+}
+
+/** Each person's look (theme, light/dark, last account) saved against their name, not the phone. */
+function savePrefs_(p) {
+  const who = p.who === 'partner' ? 'partner' : (p.who === 'owner' ? 'owner' : '');
+  if (!who) return { ok: false };
+  const prop = PropertiesService.getScriptProperties();
+  let cur = {};
+  try { cur = JSON.parse(prop.getProperty('prefs_' + who) || '{}'); } catch (e) {}
+  Object.keys(p.prefs || {}).forEach(k => { if (/^bt_/.test(k)) cur[k] = p.prefs[k]; });
+  prop.setProperty('prefs_' + who, JSON.stringify(cur).slice(0, 8000));
+  return { ok: true };
+}
+
+/** "haircut" → "Haircut", "  maccas  " → "Maccas"; words already typed with capitals are left alone. */
+function tidyName_(n) {
+  n = String(n || '').replace(/[()\/]/g, ' ').replace(/\s+/g, ' ').trim();
+  return n.split(' ').map(w => w && w === w.toLowerCase() ? w.charAt(0).toUpperCase() + w.slice(1) : w).join(' ');
+}
+
+/** The GitHub-hosted app talks to the sheet through here (same actions as inside Google). */
+function doPost(e) {
+  let out;
+  try {
+    const req = JSON.parse((e && e.postData && e.postData.contents) || '{}');
+    out = { ok: true, data: api(req.action, '', req.payload || {}) };
+  } catch (err) {
+    out = { ok: false, error: String((err && err.message) || err) };
+  }
+  return ContentService.createTextOutput(JSON.stringify(out)).setMimeType(ContentService.MimeType.JSON);
+}
+
+/** Single entry point used by the app. */
+function api(action, pin, payload) {
+  payload = payload || {};
+  if (action === 'savePrefs') return savePrefs_(payload);
+  const ctx = auth_(pin);
+  switch (action) {
+    case 'bootstrap': return bootstrap_(ctx, payload);
+    case 'addSpend':  return addSpend_(ctx, payload);
+    case 'saveDay':   return saveDay_(ctx, payload);
+    case 'editItems': return editItems_(ctx, payload);
+    case 'addRow':    return addRow_(ctx, payload.tab, payload.values);
+    case 'updateRow': return updateRow_(ctx, payload.tab, payload.row, payload.values, payload.expect);
+    case 'deleteRow': return deleteRow_(ctx, payload.tab, payload.row, payload.expect);
+    case 'admin':     return admin_(ctx);
+    case 'saveAdmin': return saveAdmin_(ctx, payload);
+    default: throw new Error('Unknown action');
+  }
+}
+
+/* =============================== SETUP =============================== */
+
+function setup() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(SETTINGS_SHEET);
+  if (!sh) {
+    sh = ss.insertSheet(SETTINGS_SHEET);
+    sh.getRange('A1').setValue('Budget app settings').setFontWeight('bold').setFontSize(14);
+    sh.getRange('A2').setValue('Tick or untick to control the app. Changes apply next time the app refreshes.')
+      .setFontColor('#666666');
+    const rows = [
+      [KEYS.ownerName, 'Paul'],
+      [KEYS.partnerName, 'Flo'],
+      [KEYS.appName, 'PLO']
+    ];
+    sh.getRange(4, 1, rows.length, 2).setValues(rows);
+    sh.getRange(4, 1, rows.length, 1).setFontWeight('bold');
+
+    sh.getRange(TAB_HEADER_ROW - 1, 1).setValue('Tabs the app can see').setFontWeight('bold').setFontSize(12);
+    sh.getRange(TAB_HEADER_ROW, 1, 1, 3)
+      .setValues([['Tab', 'Show in app', 'Header row (blank = auto)']])  // column D (Tab ID) is added by syncTabs_
+      .setFontWeight('bold').setBackground('#F1F3F4');
+    sh.setColumnWidth(1, 300); sh.setColumnWidth(2, 140); sh.setColumnWidth(3, 190);
+    sh.getRange(TAB_HEADER_ROW - 1, 5).setValue('Extra logos (optional)').setFontWeight('bold').setFontSize(12);
+    sh.getRange(TAB_HEADER_ROW, 5, 1, 2).setValues([['Word in the note', 'Brand website (e.g. bunnings.com.au)']])
+      .setFontWeight('bold').setBackground('#F1F3F4');
+    sh.setColumnWidth(5, 200); sh.setColumnWidth(6, 280);
+  }
+  syncTabs_(sh);
+  const s = getSettings_();
+  Logger.log('Setup done. ' + s.tabs.length + ' tabs listed in App Settings. No PIN needed: open the web app link.');
+}
+
+
+/** New tabs get listed automatically (switched on). */
+/**
+ * Keeps the "Tabs the app can see" list in step with your tabs, matched by Google's tab ID
+ * (column D), so renaming a tab keeps its on/off switch and header-row setting, new tabs are
+ * added (switched on), and deleted tabs drop off. Only writes when something actually changed.
+ * The logo table in columns E:F is never touched.
+ */
+function syncTabs_(sh) {
+  const ss = SpreadsheetApp.getActive();
+  if (String(sh.getRange(TAB_HEADER_ROW, 4).getValue()) === '') {
+    sh.getRange(TAB_HEADER_ROW, 4).setValue('Tab ID (automatic, don\u2019t edit)').setFontWeight('bold').setBackground('#F1F3F4').setFontColor('#999999');
+    sh.setColumnWidth(4, 170);
+  }
+  const last = Math.max(sh.getLastRow(), TAB_HEADER_ROW);
+  const n = last - TAB_HEADER_ROW;
+  const rows = (n > 0 ? sh.getRange(TAB_HEADER_ROW + 1, 1, n, 4).getValues() : [])
+    .filter(r => String(r[0]) !== '' || String(r[3]) !== '');
+  const taken = {};
+  const out = ss.getSheets().filter(t => t.getName() !== SETTINGS_SHEET).map(t => {
+    const id = String(t.getSheetId()), name = t.getName();
+    let k = rows.findIndex((r, i) => !taken[i] && String(r[3]) === id);
+    if (k < 0) k = rows.findIndex((r, i) => !taken[i] && String(r[3]) === '' && String(r[0]) === name); // rows from before IDs existed
+    if (k >= 0) taken[k] = true;
+    const r = k >= 0 ? rows[k] : null;
+    return [name, r ? r[1] === true : true, r ? r[2] : '', id];
+  });
+  const same = out.length === rows.length && out.every((r, i) =>
+    String(rows[i][0]) === r[0] && (rows[i][1] === true) === r[1] && String(rows[i][2]) === String(r[2]) && String(rows[i][3]) === r[3]);
+  if (same) return;
+  if (n > 0) { const rg = sh.getRange(TAB_HEADER_ROW + 1, 1, n, 4); rg.clearContent(); rg.clearDataValidations(); }
+  if (out.length) {
+    sh.getRange(TAB_HEADER_ROW + 1, 1, out.length, 1).setNumberFormat('@');
+    sh.getRange(TAB_HEADER_ROW + 1, 4, out.length, 1).setNumberFormat('@').setFontColor('#999999');
+    sh.getRange(TAB_HEADER_ROW + 1, 2, out.length, 1).insertCheckboxes();
+    sh.getRange(TAB_HEADER_ROW + 1, 1, out.length, 4).setValues(out);
+  }
+}
+
+function getSettings_() {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName(SETTINGS_SHEET);
+  if (!sh) { setup(); sh = ss.getSheetByName(SETTINGS_SHEET); }
+  syncTabs_(sh);
+  const map = {};
+  sh.getRange(1, 1, TAB_HEADER_ROW - 1, 2).getValues().forEach(r => {
+    if (typeof r[0] === 'string' && r[0].trim()) map[r[0].trim()] = r[1];
+  });
+  const last = sh.getLastRow();
+  const tabs = last > TAB_HEADER_ROW
+    ? sh.getRange(TAB_HEADER_ROW + 1, 1, last - TAB_HEADER_ROW, 4).getValues()
+        .filter(r => String(r[0]) !== '')
+        .map(r => ({ name: String(r[0]), on: r[1] === true, headerRow: parseInt(r[2], 10) || 0, id: String(r[3]) }))
+    : [];
+  const logos = last > TAB_HEADER_ROW
+    ? sh.getRange(TAB_HEADER_ROW + 1, 5, last - TAB_HEADER_ROW, 2).getValues()
+        .filter(r => String(r[0]).trim() && String(r[1]).trim())
+        .map(r => ({ word: String(r[0]).trim(), site: String(r[1]).trim().replace(/^https?:\/\//, '').replace(/\/.*$/, '') }))
+    : [];
+  return {
+    sheet: sh,
+    logos: logos,
+    access: map[KEYS.access] === true,
+    canEdit: map[KEYS.canEdit] === true,
+    canDelete: map[KEYS.canDelete] === true,
+    partnerPin: String(map[KEYS.partnerPin] || '').trim(),
+    ownerPin: String(map[KEYS.ownerPin] || '').trim(),
+    partnerName: String(map[KEYS.partnerName] || map['Who is using it (partner name)'] || 'Partner').trim(),
+    ownerName: String(map[KEYS.ownerName] || 'Me').trim(),
+    appName: rememberName_(String(map[KEYS.appName] || 'PLO')),
+    tabs: tabs
+  };
+}
+
+/** Keeps the app name handy so the page can open without reading the sheet. */
+function rememberName_(name) {
+  try {
+    const pr = PropertiesService.getScriptProperties();
+    if (pr.getProperty('appName') !== name) pr.setProperty('appName', name);
+  } catch (e) {}
+  return name;
+}
+
+/* =============================== AUTH =============================== */
+
+/** No PIN: anyone with the web app link gets the full app (keep the link private). */
+function auth_() {
+  return { role: 'owner', s: getSettings_() };
+}
+
+function requireEdit_(ctx) { return;
+  if (ctx.role !== 'owner' && !ctx.s.canEdit) throw new Error('Editing is switched off in App Settings');
+}
+
+/* ============================ OWNER BACKEND ============================ */
+/* Settings screen in the app (gear > Settings).                            */
+
+function findKeyRow_(sh, label) {
+  const vals = sh.getRange(1, 1, TAB_HEADER_ROW - 1, 1).getValues();
+  for (let i = 0; i < vals.length; i++) if (String(vals[i][0]).trim() === label) return i + 1;
+  // Older setups used a different label for the partner name
+  if (label === KEYS.partnerName) {
+    for (let i = 0; i < vals.length; i++) if (String(vals[i][0]).trim() === 'Who is using it (partner name)') return i + 1;
+  }
+  return 0;
+}
+
+function admin_(ctx) {
+  const s = ctx.s;
+  return {
+    partnerName: s.partnerName, ownerName: s.ownerName, appName: s.appName,
+    logos: s.logos,
+    tabs: s.tabs.map(t => ({ name: t.name, on: t.on, id: t.id })),
+    sheetUrl: SpreadsheetApp.getActive().getUrl() + '#gid=' + s.sheet.getSheetId()
+  };
+}
+
+function saveAdmin_(ctx, p) {
+  const sh = ctx.s.sheet;
+  const set = (label, v) => {
+    let r = findKeyRow_(sh, label);
+    if (!r) { // add the row if this settings tab was made by an older version
+      for (let i = 4; i < TAB_HEADER_ROW - 1; i++) if (String(sh.getRange(i, 1).getValue()) === '') { r = i; sh.getRange(i, 1).setValue(label).setFontWeight('bold'); break; }
+    }
+    if (r) sh.getRange(r, 2).setValue(v);
+  };
+  if ('partnerName' in p && String(p.partnerName).trim()) set(KEYS.partnerName, String(p.partnerName).trim().slice(0, 30));
+  if ('ownerName' in p && String(p.ownerName).trim()) set(KEYS.ownerName, String(p.ownerName).trim().slice(0, 30));
+  if ('appName' in p && String(p.appName).trim()) set(KEYS.appName, String(p.appName).trim().slice(0, 30));
+  if (p.logos) {
+    const lr = Math.max(sh.getLastRow(), TAB_HEADER_ROW + 1);
+    sh.getRange(TAB_HEADER_ROW + 1, 5, lr - TAB_HEADER_ROW, 2).clearContent();
+    const rows = p.logos.filter(l => l && String(l.word).trim() && String(l.site).trim())
+      .map(l => [String(l.word).trim(), String(l.site).trim().replace(/^https?:\/\//, '').replace(/\/.*$/, '')]);
+    if (rows.length) sh.getRange(TAB_HEADER_ROW + 1, 5, rows.length, 2).setValues(rows);
+  }
+  if (p.tabs) {
+    const last = sh.getLastRow();
+    if (last > TAB_HEADER_ROW) {
+      const names = sh.getRange(TAB_HEADER_ROW + 1, 1, last - TAB_HEADER_ROW, 1).getValues();
+      names.forEach((r, i) => {
+        const n = String(r[0]);
+        if (Object.prototype.hasOwnProperty.call(p.tabs, n)) sh.getRange(TAB_HEADER_ROW + 1 + i, 2).setValue(!!p.tabs[n]);
+      });
+    }
+  }
+  SpreadsheetApp.flush();
+  return admin_(auth_());
+}
+
+
+function tabFor_(ctx, name) {
+  const t = ctx.s.tabs.filter(x => x.name === name)[0];
+  if (!t || !t.on || name === SETTINGS_SHEET) throw new Error('That tab is switched off in App Settings');
+  const sh = SpreadsheetApp.getActive().getSheetByName(name);
+  if (!sh) throw new Error('Tab not found: ' + name);
+  return { sh: sh, headerRow: t.headerRow };
+}
+
+/* =============================== READ =============================== */
+
+function bootstrap_(ctx, p) {
+  const quick = !!(p && p.quick);
+  const s = ctx.s, ss = SpreadsheetApp.getActive(), tz = ss.getSpreadsheetTimeZone();
+  const tabs = [];
+  s.tabs.forEach(t => {
+    if (!t.on) return;
+    const sh = ss.getSheetByName(t.name);
+    if (!sh) return;
+    try { tabs.push(readTab_(sh, t.headerRow, quick)); }
+    catch (e) { tabs.push({ name: t.name, kind: 'error', error: String(e.message || e) }); }
+  });
+  const out = {
+    role: ctx.role,
+    appName: s.appName,
+    partnerName: s.partnerName,
+    ownerName: s.ownerName,
+    canEdit: ctx.role === 'owner' || s.canEdit,
+    canDelete: ctx.role === 'owner' || s.canDelete,
+    access: s.access,
+    today: Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd'),
+    logos: s.logos,
+    quick: quick,
+    tabs: tabs
+  };
+  if (quick) cachePut_('quick', out);
+  return out;
+}
+
+function headerInfo_(sh, override) {
+  const lastRow = sh.getLastRow(), lastCol = sh.getLastColumn();
+  if (lastRow < 1 || lastCol < 1) return null;
+  const scan = sh.getRange(1, 1, Math.min(lastRow, 15), lastCol).getDisplayValues();
+  let headerRow = override || 0;
+  if (!headerRow) {
+    headerRow = 1;
+    for (let i = 0; i < scan.length; i++) {
+      if (scan[i].filter(v => String(v).trim() !== '').length >= Math.min(2, lastCol)) { headerRow = i + 1; break; }
+    }
+  }
+  const hv = headerRow <= scan.length ? scan[headerRow - 1] : sh.getRange(headerRow, 1, 1, lastCol).getDisplayValues()[0];
+  let width = 0;
+  hv.forEach((h, i) => { if (String(h).trim()) width = i + 1; });
+  if (!width) width = lastCol;
+  return { headerRow, width, lastRow, headers: hv.slice(0, width).map(h => String(h).trim()) };
+}
+
+function readTab_(sh, override, quick) {
+  const hi = headerInfo_(sh, override);
+  if (!hi) return { name: sh.getName(), id: sh.getSheetId(), kind: 'list', columns: [], rows: [] };
+  const L = ledgerLayout_(sh, hi);
+  return L ? readLedger_(sh, hi, L, quick) : readList_(sh, hi);
+}
+
+/* ----------------------------- LEDGER TABS ----------------------------- */
+/* A ledger tab = one row per day with Day, Date and Running Total columns. */
+
+function ledgerLayout_(sh, hi) {
+  const h = hi.headers.map(x => x.toLowerCase());
+  const day = h.findIndex(x => /^day$/.test(x));
+  const date = h.findIndex(x => /^date/.test(x));
+  // Running Total: column C on your tabs (falls back to any "Running Total" header).
+  const run = /running\s*total/.test(h[2] || '') ? 2 : h.findIndex(x => /running\s*total/.test(x));
+  if (date === -1 || run === -1) return null;
+
+  // Read sign of each column from the Running Total formula on a data row.
+  let signs = {};
+  const probeRow = Math.min(hi.headerRow + 3, hi.lastRow);
+  if (probeRow > hi.headerRow) {
+    const f = sh.getRange(probeRow, run + 1).getFormula();
+    if (f) signs = columnSigns_(f);
+  }
+
+  const notes = [], amounts = [];
+  hi.headers.forEach((name, i) => {
+    if (!name || i === day || i === date || i === run) return;
+    if (/note|^from$|comment|detail/i.test(name)) { notes.push({ i: i, name: name }); return; }
+    const sign = signs[i] || 0;
+    amounts.push({ i: i, name: name, kind: sign > 0 ? 'in' : sign < 0 ? 'out' : 'info' });
+  });
+
+  // Paul's rule: the last money column before the notes is income into the account.
+  if (notes.length) {
+    const lastBefore = amounts.filter(a => a.i < notes[0].i).pop();
+    if (lastBefore) lastBefore.kind = 'in';
+  }
+
+  // Which note column each money column writes to.
+  const billNote = notes.filter(n => /bill/i.test(n.name))[0];
+  const mainNote = notes.filter(n => !/bill/i.test(n.name))[0] || notes[0];
+  amounts.forEach(a => {
+    let n = mainNote;
+    if (billNote && /bill|rent|loan|repay|petrol|grocer/i.test(a.name)) n = billNote;
+    a.note = n ? n.i : -1;
+  });
+  return { day, date, run, notes, amounts };
+}
+
+/** Parses e.g. =C2-(D3:D426)-(G3:G426)+(H3:H426) → {3:-1, 6:-1, 7:+1}. */
+function columnSigns_(f) {
+  const out = {}, stack = [1];
+  let op = 1, i = 0;
+  f = String(f).replace(/^=/, '');
+  while (i < f.length) {
+    const c = f[i];
+    if (c === '+') { op = 1; i++; continue; }
+    if (c === '-') { op = -1; i++; continue; }
+    if (c === '(') { stack.push(stack[stack.length - 1] * op); op = 1; i++; continue; }
+    if (c === ')') { stack.pop(); if (!stack.length) stack.push(1); op = 1; i++; continue; }
+    const m = /^\$?([A-Za-z]{1,3})\$?\d+(?::\$?[A-Za-z]{1,3}\$?\d+)?/.exec(f.slice(i));
+    if (m) {
+      const col = colIndex_(m[1].toUpperCase());
+      const sgn = stack[stack.length - 1] * op;
+      if (out[col] === undefined) out[col] = sgn;
+      op = 1; i += m[0].length; continue;
+    }
+    i++;
+  }
+  return out;
+}
+
+function readLedger_(sh, hi, L, quick) {
+  const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+  const today = Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd');
+  const first = hi.headerRow + 1;
+  const n = hi.lastRow - hi.headerRow;
+  if (n <= 0) return { name: sh.getName(), id: sh.getSheetId(), kind: 'ledger', layout: L, headers: hi.headers, days: [], today: today };
+
+  const dateVals = sh.getRange(first, L.date + 1, n, 1).getValues();
+  let todayIdx = -1;
+  for (let i = 0; i < n; i++) {
+    const d = dateVals[i][0];
+    if (d instanceof Date && Utilities.formatDate(d, tz, 'yyyy-MM-dd') <= today) todayIdx = i;
+  }
+  if (todayIdx === -1) todayIdx = 0;
+  const startIdx = Math.max(0, todayIdx - (quick ? QUICK_BACK : DAYS_BACK));
+  const endIdx = Math.min(n - 1, todayIdx + (quick ? QUICK_AHEAD : DAYS_AHEAD));
+  const cnt = endIdx - startIdx + 1;
+
+  const rg = sh.getRange(first + startIdx, 1, cnt, hi.width);
+  const disp = rg.getDisplayValues(), vals = rg.getValues(), forms = rg.getFormulas();
+  const days = [];
+  for (let k = 0; k < cnt; k++) {
+    const dv = dateVals[startIdx + k][0];
+    if (!(dv instanceof Date)) continue;
+    const raw = vals[k].map((v, c) => forms[k][c] ? forms[k][c] : (v instanceof Date ? '' : String(v)));
+    days.push({ r: first + startIdx + k, date: Utilities.formatDate(dv, tz, 'yyyy-MM-dd'), d: disp[k], raw: raw });
+  }
+  const cf = cfRules_(sh);
+  const fmtRow = first + todayIdx;
+  const fmts = sh.getRange(fmtRow, 1, 1, hi.width).getNumberFormats()[0];
+  return {
+    name: sh.getName(), id: sh.getSheetId(), kind: 'ledger', headers: hi.headers, layout: L,
+    moneyFmt: fmts[L.run] || '', today: today, days: days, cf: cf,
+    partial: startIdx > 0 || endIdx < n - 1
+  };
+}
+
+/** Reads the tab's conditional-formatting colour rules (number rules only) for the app. */
+function cfRules_(sh) {
+  const out = [];
+  let theme = null;
+  try { theme = SpreadsheetApp.getActive().getSpreadsheetTheme(); } catch (e) {}
+  const hex = (colorObj, plain) => {
+    try {
+      if (colorObj) {
+        const t = colorObj.getColorType();
+        if (t === SpreadsheetApp.ColorType.RGB) return colorObj.asRgbColor().asHexString();
+        if (t === SpreadsheetApp.ColorType.THEME && theme) return theme.getConcreteColor(colorObj.asThemeColor().getThemeColorType()).asRgbColor().asHexString();
+      }
+    } catch (e) {}
+    return plain || '';
+  };
+  try {
+    sh.getConditionalFormatRules().forEach(rule => {
+      const bc = rule.getBooleanCondition();
+      if (!bc) return;
+      const type = String(bc.getCriteriaType());
+      if (type.indexOf('NUMBER') !== 0) return;
+      const cols = [];
+      rule.getRanges().forEach(r => { for (let c = r.getColumn(); c < r.getColumn() + r.getNumColumns(); c++) cols.push(c - 1); });
+      out.push({
+        cols: cols, t: type, v: bc.getCriteriaValues().map(String),
+        bg: hex(bc.getBackgroundObject ? bc.getBackgroundObject() : null, bc.getBackground()),
+        fg: hex(bc.getFontColorObject ? bc.getFontColorObject() : null, bc.getFontColor()),
+        b: bc.getBold() === true
+      });
+    });
+  } catch (e) {}
+  return out;
+}
+
+/* Amount as you'd write it in a note: 110, 20.33, 15.60 */
+function noteAmt_(n) {
+  n = Math.round(n * 100) / 100;
+  return n % 1 === 0 ? String(n) : n.toFixed(2);
+}
+
+function escRe_(s) { return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'); }
+
+function addSpend_(ctx, p) {
+  const t = tabFor_(ctx, p.tab);
+  const amount = Math.round(parseFloat(p.amount) * 100) / 100;
+  if (!(amount > 0)) throw new Error('Enter an amount');
+  if (p.name) p.name = tidyName_(p.name);
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(20000);
+  try {
+    const sh = t.sh, hi = headerInfo_(sh, t.headerRow), L = ledgerLayout_(sh, hi);
+    if (!L) throw new Error('This tab is not a daily ledger');
+    const col = L.amounts.filter(a => a.i === Number(p.col))[0];
+    if (!col) throw new Error('Pick a column');
+    const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+    const row = findDateRow_(sh, hi, L, p.date, tz);
+
+    // 1) Money cell: blank → 45.26 ; 70 → =SUM(70+45.26) ; =SUM(70+10) → =SUM(70+10+45.26)
+    const cell = sh.getRange(row, col.i + 1);
+    const f = cell.getFormula(), a = noteAmt_(amount);
+    const pm = parseMoney_(f, cell.getValue());
+    if (pm) { pm.terms.push(amount); writeTerms_(cell, pm); }
+    else if (f) cell.setFormula('=SUM((' + f.slice(1) + ')+' + a + ')');   // unusual formula: wrap it safely
+    else cell.setValue(amount);
+    // Keep the money format the column already uses.
+    const nf = cell.getNumberFormat();
+    if (!nf || nf === 'General' || nf === '0.###############') {
+      const above = sh.getRange(Math.max(hi.headerRow + 1, row - 1), col.i + 1).getNumberFormat();
+      cell.setNumberFormat(above && above !== 'General' ? above : '"$"#,##0.00');
+    }
+
+    // 2) Note: "Existing / Name (45.26)", or merge "Fitstop (54)" → "Fitstop (54+54)"
+    const name = String(p.name || '').trim() || col.name.trim();
+    if (col.note !== -1) {
+      const nc = sh.getRange(row, col.note + 1);
+      let note = String(nc.getValue() || '').replace(/\s+$/, '');
+      const re = new RegExp('(^|/\\s*)(' + escRe_(name) + ')\\s*\\(([^)]*)\\)', 'i');
+      if (re.test(note)) note = note.replace(re, (m, pre, nm, inner) => pre + nm + ' (' + inner + '+' + a + ')');
+      else note = note ? note + ' / ' + name + ' (' + a + ')' : name + ' (' + a + ')';
+      nc.setValue(note);
+    }
+    SpreadsheetApp.flush();
+    return dayOut_(sh, hi, row, tz);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+/** Edit a whole day in raw form: money cells as "70+45.26" and the note text. */
+function saveDay_(ctx, p) {
+  requireEdit_(ctx);
+  const t = tabFor_(ctx, p.tab);
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(20000);
+  try {
+    const sh = t.sh, hi = headerInfo_(sh, t.headerRow), L = ledgerLayout_(sh, hi);
+    if (!L) throw new Error('This tab is not a daily ledger');
+    const row = parseInt(p.row, 10);
+    if (!(row > hi.headerRow)) throw new Error('Bad row');
+    const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+    if (p.expect) {
+      const now = dayOut_(sh, hi, row, tz).raw;
+      if (now.join('\u0001') !== p.expect.join('\u0001')) throw new Error('CHANGED');
+    }
+    const cells = p.cells || {};
+    L.amounts.forEach(a => {
+      if (!Object.prototype.hasOwnProperty.call(cells, a.i)) return;
+      const expr = String(cells[a.i]).replace(/[$,\s]/g, '');
+      const c = sh.getRange(row, a.i + 1);
+      if (expr === '') c.clearContent();
+      else if (/^-?\d+(\.\d+)?$/.test(expr)) c.setValue(parseFloat(expr));
+      else if (/^[0-9.+\-*/()]+$/.test(expr)) c.setFormula('=SUM(' + expr + ')');
+      else throw new Error('"' + a.name + '" can only contain numbers and + - * /');
+    });
+    L.notes.forEach(nt => {
+      if (Object.prototype.hasOwnProperty.call(cells, nt.i)) sh.getRange(row, nt.i + 1).setValue(String(cells[nt.i]));
+    });
+    SpreadsheetApp.flush();
+    return dayOut_(sh, hi, row, tz);
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function splitNote_(note) {
+  const out = []; let cur = '', d = 0; note = String(note || '');
+  for (let i = 0; i < note.length; i++) {
+    const c = note[i];
+    if (c === '(') d++; if (c === ')') d = Math.max(0, d - 1);
+    if (c === '/' && d === 0) { if (cur.trim()) out.push(cur.trim()); cur = ''; } else cur += c;
+  }
+  if (cur.trim()) out.push(cur.trim());
+  return out;
+}
+function evalSimple_(e) {
+  e = String(e).replace(/\s/g, '').replace(/[+\-]+$/, '');
+  if (!/^[0-9.+\-]+$/.test(e)) return null;
+  let tot = 0; const m = e.match(/[+\-]?[0-9.]+/g); if (!m) return null;
+  m.forEach(x => tot += parseFloat(x));
+  return Math.round(tot * 100) / 100;
+}
+/** Reads a money cell the way you write them: 70 | =sum(160+110) | =SUM(..) | =(151.74+222.96) | =54+54
+ *  Returns {style, terms} so it can be written back in exactly the same style, or null if it's something else. */
+function parseMoney_(f, v) {
+  if (f) {
+    const t = String(f).trim();
+    let m = /^=\s*(sum|Sum|SUM)?\s*\(\s*([0-9.+\s]+)\)\s*$/.exec(t);
+    if (m) return { style: '=' + (m[1] || '') + '(', terms: m[2].split('+').map(x => parseFloat(x)).filter(x => !isNaN(x)) };
+    m = /^=\s*([0-9.+\s]+)$/.exec(t);
+    if (m) return { style: '=', terms: m[1].split('+').map(x => parseFloat(x)).filter(x => !isNaN(x)) };
+    return null;
+  }
+  if (v === '' || v === null) return { style: null, terms: [] };
+  const n = parseFloat(String(v).replace(/[$,]/g, ''));
+  return isNaN(n) ? null : { style: null, terms: [n] };
+}
+function buildMoney_(style, terms) {
+  if (!terms.length) return '';
+  const body = terms.map(noteAmt_).join('+');
+  if (style === '=') return '=' + body;
+  if (style) return style + body + ')';
+  return terms.length === 1 ? terms[0] : '=SUM(' + body + ')';
+}
+function cellTerms_(cell) { return parseMoney_(cell.getFormula(), cell.getValue()); }
+function writeTerms_(cell, pm) {
+  const out = buildMoney_(pm.style, pm.terms);
+  if (out === '') cell.clearContent();
+  else if (typeof out === 'number') cell.setValue(out);
+  else cell.setFormula(out);
+}
+function editItems_(ctx, p) {
+  requireEdit_(ctx);
+  const t = tabFor_(ctx, p.tab);
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(20000);
+  try {
+    const sh = t.sh, hi = headerInfo_(sh, t.headerRow), L = ledgerLayout_(sh, hi);
+    if (!L) throw new Error('This tab is not a daily ledger');
+    let done = 0;
+    (p.items || []).forEach(it => {
+      const row = parseInt(it.row, 10), noteCol = parseInt(it.note, 10);
+      if (!(row > hi.headerRow)) throw new Error('Bad row');
+      const nc = sh.getRange(row, noteCol + 1);
+      const parts = splitNote_(nc.getValue());
+      const oldAmt = Math.round(parseFloat(it.oldAmt) * 100) / 100;
+      const idx = parts.findIndex(pt => {
+        const m = /^(.*?)\s*\(([^()]*)\)\s*$/.exec(pt);
+        return m && m[1].trim().toLowerCase() === String(it.name).trim().toLowerCase() && Math.abs((evalSimple_(m[2]) || 0) - oldAmt) < 0.005;
+      });
+      if (idx < 0) throw new Error('Couldn\u2019t find "' + it.name + ' (' + noteAmt_(oldAmt) + ')" in that day\u2019s note. It may have changed in the sheet.');
+      const itemExpr = /\(([^()]*)\)\s*$/.exec(parts[idx])[1];
+      const itemTerms = itemExpr.split('+').map(x => parseFloat(x)).filter(x => !isNaN(x));
+      // Which money column holds it? Look for the amount (or its parts, e.g. 54+54) in the mapped columns.
+      const cols = L.amounts.filter(a => a.note === noteCol);
+      let target = null, terms = null, at = [], pm = null;
+      for (const a of cols) {
+        const got = cellTerms_(sh.getRange(row, a.i + 1)); if (!got) continue;
+        const tt = got.terms; pm = got;
+        const k = tt.findIndex(x => Math.abs(x - oldAmt) < 0.005);
+        if (k >= 0) { target = a; terms = tt; at = [k]; break; }
+        const used = []; let ok = itemTerms.length > 1;
+        itemTerms.forEach(x => { const j = tt.findIndex((y, q) => used.indexOf(q) < 0 && Math.abs(y - x) < 0.005); if (j < 0) ok = false; else used.push(j); });
+        if (ok) { target = a; terms = tt; at = used; break; }
+      }
+      if (!target) throw new Error('Couldn\u2019t tell which column holds ' + it.name + '. Tap that day and edit it directly.');
+      const remove = it.remove === true || !(parseFloat(it.newAmt) > 0);
+      const newAmt = remove ? 0 : Math.round(parseFloat(it.newAmt) * 100) / 100;
+      at.sort((a, b) => b - a).forEach((q, n) => { if (n === at.length - 1 && !remove) terms[q] = newAmt; else terms.splice(q, 1); });
+      pm.terms = terms;
+      writeTerms_(sh.getRange(row, target.i + 1), pm);
+      if (remove) parts.splice(idx, 1);
+      else parts[idx] = (String(it.newName || it.name).trim()) + ' (' + noteAmt_(newAmt) + ')';
+      nc.setValue(parts.join(' / '));
+      done++;
+    });
+    SpreadsheetApp.flush();
+    return { done: done };
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function findDateRow_(sh, hi, L, ymd, tz) {
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(ymd))) throw new Error('Pick a date');
+  const n = hi.lastRow - hi.headerRow;
+  const vals = sh.getRange(hi.headerRow + 1, L.date + 1, n, 1).getValues();
+  for (let i = n - 1; i >= 0; i--) {
+    const d = vals[i][0];
+    if (d instanceof Date && Utilities.formatDate(d, tz, 'yyyy-MM-dd') === ymd) return hi.headerRow + 1 + i;
+  }
+  throw new Error('There is no row for that date in "' + sh.getName() + '" yet');
+}
+
+function dayOut_(sh, hi, row, tz) {
+  const rg = sh.getRange(row, 1, 1, hi.width);
+  const v = rg.getValues()[0], f = rg.getFormulas()[0];
+  const L = ledgerLayout_(sh, hi);
+  const dv = v[L.date];
+  return {
+    r: row,
+    date: dv instanceof Date ? Utilities.formatDate(dv, tz, 'yyyy-MM-dd') : '',
+    d: rg.getDisplayValues()[0],
+    raw: v.map((x, c) => f[c] ? f[c] : (x instanceof Date ? '' : String(x)))
+  };
+}
+
+/* ------------------------------ LIST TABS ------------------------------ */
+/* Anything else (e.g. Houses): one row per item, add/edit like a form.     */
+
+function listMeta_(sh, hi) {
+  const first = hi.headerRow + 1;
+  const start = Math.max(first, hi.lastRow - MAX_LIST_ROWS + 1);
+  const n = hi.lastRow >= start ? hi.lastRow - start + 1 : 0;
+  let values = [], display = [], formulas = [];
+  if (n > 0) {
+    const rg = sh.getRange(start, 1, n, hi.width);
+    values = rg.getValues(); display = rg.getDisplayValues(); formulas = rg.getFormulas();
+  }
+  let refIdx = -1;
+  for (let i = n - 1; i >= 0; i--) {
+    if (display[i].some((v, c) => v !== '' && !formulas[i][c])) { refIdx = i; break; }
+  }
+  const refRow = refIdx >= 0 ? start + refIdx : first;
+  const ref = sh.getRange(refRow, 1, 1, hi.width);
+  const fmts = ref.getNumberFormats()[0], dvs = ref.getDataValidations()[0];
+  const rf = refIdx >= 0 ? formulas[refIdx] : ref.getFormulas()[0];
+  const rv = refIdx >= 0 ? values[refIdx] : ref.getValues()[0];
+  const columns = hi.headers.map((h, c) => describeColumn_(h || ('Column ' + colLetter_(c + 1)), c, fmts[c], dvs[c], rf[c], rv[c]));
+  let lastDataRow = hi.headerRow;
+  for (let i = n - 1; i >= 0; i--) {
+    if (columns.some((col, c) => col.type !== 'formula' && display[i][c] !== '')) { lastDataRow = start + i; break; }
+  }
+  return { start, n, values, display, formulas, columns, refRow, lastDataRow };
+}
+
+function describeColumn_(header, c, fmt, dv, formula, sample) {
+  const col = { i: c, name: header, type: 'text', fmt: fmt || '' };
+  const h = header.toLowerCase();
+  if (formula) col.type = 'formula';
+  else if (dv) {
+    const T = SpreadsheetApp.DataValidationCriteria, crit = dv.getCriteriaType(), args = dv.getCriteriaValues();
+    if (crit === T.CHECKBOX) col.type = 'checkbox';
+    else if (crit === T.VALUE_IN_LIST) { col.type = 'select'; col.options = (args[0] || []).map(String); }
+    else if (crit === T.VALUE_IN_RANGE) {
+      col.type = 'select';
+      try { col.options = args[0].getDisplayValues().reduce((a, r) => a.concat(r), []).map(String).filter((v, i, a) => v && a.indexOf(v) === i); }
+      catch (e) { col.options = []; }
+    }
+    else if (String(crit).indexOf('DATE') === 0) col.type = 'date';
+  }
+  if (col.type === 'text') {
+    const f = (fmt || '').toLowerCase();
+    if (sample instanceof Date || /(d-m|d\/m|m\/d|mmm|yy)/.test(f)) col.type = 'date';
+    else if (typeof sample === 'boolean') col.type = 'checkbox';
+    else if (/\$|€|£|đ|rp/.test(f)) col.type = 'currency';
+    else if (f.indexOf('%') !== -1) col.type = 'percent';
+    else if (typeof sample === 'number') col.type = /price|amount|cost|total|\$/.test(h) ? 'currency' : 'number';
+    else if (sample === '' && /date|when/.test(h)) col.type = 'date';
+    else if (sample === '' && /price|amount|cost|\$/.test(h)) col.type = 'currency';
+  }
+  return col;
+}
+
+function readList_(sh, hi) {
+  const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+  const m = listMeta_(sh, hi);
+  const rows = [];
+  for (let i = 0; i < m.n; i++) {
+    const r = m.start + i;
+    if (r > m.lastDataRow) break;
+    if (!m.columns.some((col, c) => col.type !== 'formula' && m.display[i][c] !== '')) continue;
+    rows.push({ r: r, d: m.display[i], v: m.values[i].map(x => toClient_(x, tz)) });
+  }
+  return { name: sh.getName(), id: sh.getSheetId(), kind: 'list', columns: m.columns, rows: rows, headerRow: hi.headerRow };
+}
+
+function toClient_(x, tz) {
+  if (x instanceof Date) return Utilities.formatDate(x, tz, 'yyyy-MM-dd');
+  return x === null || x === undefined ? '' : x;
+}
+
+function fromClient_(col, v, tz) {
+  if (v === null || v === undefined) return '';
+  if (col.type === 'checkbox') return v === true || v === 'true';
+  if (v === '') return '';
+  if (col.type === 'date' && /^\d{4}-\d{2}-\d{2}$/.test(String(v))) return Utilities.parseDate(v + ' 12:00', tz, 'yyyy-MM-dd HH:mm');
+  if (col.type === 'currency' || col.type === 'number' || col.type === 'percent') {
+    const n = parseFloat(String(v).replace(/[^0-9.\-]/g, ''));
+    if (isNaN(n)) return String(v);
+    return col.type === 'percent' && Math.abs(n) > 1 ? n / 100 : n;
+  }
+  return String(v);
+}
+
+function addRow_(ctx, tab, values) {
+  const t = tabFor_(ctx, tab);
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(20000);
+  try {
+    const sh = t.sh, hi = headerInfo_(sh, t.headerRow), m = listMeta_(sh, hi);
+    const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+    const target = m.lastDataRow + 1;
+    if (target <= sh.getMaxRows()) {
+      const below = sh.getRange(target, 1, 1, hi.width).getDisplayValues()[0];
+      if (m.columns.some((col, c) => col.type !== 'formula' && below[c] !== '')) sh.insertRowAfter(m.lastDataRow);
+    } else sh.insertRowAfter(sh.getMaxRows());
+    if (m.lastDataRow > hi.headerRow) {
+      const src = sh.getRange(m.lastDataRow, 1, 1, hi.width), dst = sh.getRange(target, 1, 1, hi.width);
+      src.copyTo(dst, SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+      src.copyTo(dst, SpreadsheetApp.CopyPasteType.PASTE_DATA_VALIDATION, false);
+      const f = src.getFormulasR1C1()[0];
+      m.columns.forEach(col => { if (col.type === 'formula' && f[col.i]) sh.getRange(target, col.i + 1).setFormulaR1C1(f[col.i]); });
+    }
+    m.columns.forEach(col => {
+      if (col.type === 'formula' || !values || !Object.prototype.hasOwnProperty.call(values, col.i)) return;
+      sh.getRange(target, col.i + 1).setValue(fromClient_(col, values[col.i], tz));
+    });
+    SpreadsheetApp.flush();
+    return rowOut_(sh, target, hi.width);
+  } finally { lock.releaseLock(); }
+}
+
+function checkUnchanged_(sh, row, width, expect) {
+  if (!expect) return;
+  const now = sh.getRange(row, 1, 1, width).getDisplayValues()[0];
+  if (now.join('\u0001') !== expect.join('\u0001')) throw new Error('CHANGED');
+}
+
+function updateRow_(ctx, tab, row, values, expect) {
+  requireEdit_(ctx);
+  const t = tabFor_(ctx, tab);
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(20000);
+  try {
+    const sh = t.sh, hi = headerInfo_(sh, t.headerRow), m = listMeta_(sh, hi);
+    const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+    row = parseInt(row, 10);
+    if (!(row > hi.headerRow)) throw new Error('Bad row');
+    checkUnchanged_(sh, row, hi.width, expect);
+    m.columns.forEach(col => {
+      if (col.type === 'formula' || !Object.prototype.hasOwnProperty.call(values || {}, col.i)) return;
+      sh.getRange(row, col.i + 1).setValue(fromClient_(col, values[col.i], tz));
+    });
+    SpreadsheetApp.flush();
+    return rowOut_(sh, row, hi.width);
+  } finally { lock.releaseLock(); }
+}
+
+function deleteRow_(ctx, tab, row, expect) {
+  if (ctx.role !== 'owner' && !ctx.s.canDelete) throw new Error('Deleting is switched off in App Settings');
+  const t = tabFor_(ctx, tab);
+  const lock = LockService.getDocumentLock();
+  lock.waitLock(20000);
+  try {
+    const hi = headerInfo_(t.sh, t.headerRow);
+    row = parseInt(row, 10);
+    if (!(row > hi.headerRow)) throw new Error('Bad row');
+    if (ledgerLayout_(t.sh, hi)) throw new Error('Days in a ledger tab can be edited, not deleted');
+    checkUnchanged_(t.sh, row, hi.width, expect);
+    t.sh.deleteRow(row);
+    return { deleted: row };
+  } finally { lock.releaseLock(); }
+}
+
+function rowOut_(sh, row, width) {
+  const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+  const rg = sh.getRange(row, 1, 1, width);
+  return { r: row, d: rg.getDisplayValues()[0], v: rg.getValues()[0].map(x => toClient_(x, tz)) };
+}
+
+function colLetter_(n) {
+  let s = '';
+  while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); }
+  return s;
+}
+
+function colIndex_(letters) {
+  let n = 0;
+  for (let i = 0; i < letters.length; i++) n = n * 26 + (letters.charCodeAt(i) - 64);
+  return n - 1;
+}
