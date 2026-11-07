@@ -1598,6 +1598,7 @@ function openItem(tabName, row, noteCol, name, amt, mv){
    +(same.length>1&&!mv?'<div class="fl" style="margin:16px 4px 8px;font-size:13px;color:var(--ink3)">Which ones?</div>'
      +'<div class="toggle2" id="itMode"><button class="on" onclick="itMode(\'one\',this)">Just this day</button><button onclick="itMode(\'from\',this)">From a date on</button></div>'
      +'<label class="field" id="itFromBox" style="display:none"><span class="fl">Change every “'+esc(name)+'” of '+money(amt,tab)+' on or after</span><input id="itFrom" type="date" value="'+day.date+'" oninput="IT.from=this.value||IT.date;itPrev()"></label>':'')
+   +(function(){ var r=repeatFor(tabName,name); return '<button class="toggle" style="width:100%;margin-top:10px" onclick="itRepeat()"><span style="text-align:left">\u21bb '+(r?'Repeats: '+esc(rptText(r)):'Make this repeat')+'<small style="display:block;color:var(--ink3);font-weight:400;font-size:12px">'+(r?'Tap to change the amount, timing, or stop it':'Weekly, fortnightly, monthly, 2nd Tuesday\u2026')+'</small></span><span class="s" style="color:var(--ink3)">\u203a</span></button>'; })()
    +'<div class="writes" id="iprev"></div></div>'
    +'<div class="ft"><div class="btnrow">'+(mv?'':'<button class="btn ghost" onclick="itSave(true)">Remove</button>')+'<button class="btn" id="itBtn" onclick="itSave(false)">'+(mv?'Move':'Save')+'</button></div></div>';
   openSheet(h); itPrev(); if(mv && !itMoveTo()){ $('iprev').innerHTML='Pick the <b>new day</b> above, then tap <b>Move</b>.'; $('itBtn').disabled=true; }
@@ -1668,10 +1669,141 @@ function viewAdmin(){
   $('view').innerHTML=h;
 }
 
+/** Repeating dates. rule: {unit:'day'|'week'|'month'|'year', every:n, mode:'date'|'nth', nth:1-5 (5 = last), wd:0-6, wkday:true/false, dir:'after'|'before'} */
+function rptDates(rule, start, until, maxN) {
+  var out = [], n = Math.max(1, parseInt(rule.every, 10) || 1), cap = Math.max(1, Math.min(maxN || 800, 800));
+  function pd(s) { var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s)); return new Date(+m[1], +m[2] - 1, +m[3], 12); }
+  function fd(d) { return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
+  function nthWd(yy, mm, nth, wd) {
+    if (nth >= 5) { var last = new Date(yy, mm + 1, 0, 12); while (last.getDay() !== wd) last.setDate(last.getDate() - 1); return last; }
+    var f = new Date(yy, mm, 1, 12); while (f.getDay() !== wd) f.setDate(f.getDate() + 1); f.setDate(f.getDate() + 7 * (nth - 1)); return f;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(start))) return out;
+  var s = pd(start), d, ds, i;
+  for (i = 0; out.length < cap && i < 3000; i++) {
+    if (rule.unit === 'day' || rule.unit === 'week') { d = new Date(s); d.setDate(s.getDate() + i * n * (rule.unit === 'week' ? 7 : 1)); }
+    else if (rule.unit === 'month') {
+      var mo = s.getMonth() + i * n, yy = s.getFullYear() + Math.floor(mo / 12), mm = ((mo % 12) + 12) % 12;
+      if (rule.mode === 'nth') d = nthWd(yy, mm, +rule.nth || 1, +rule.wd || 0);
+      else d = new Date(yy, mm, Math.min(s.getDate(), new Date(yy, mm + 1, 0).getDate()), 12);
+    } else { var y2 = s.getFullYear() + i * n; d = new Date(y2, s.getMonth(), Math.min(s.getDate(), new Date(y2, s.getMonth() + 1, 0).getDate()), 12); }
+    ds = fd(d);
+    if (until && ds > until) break;
+    if (ds < start) continue;
+    if (rule.wkday) { var w = d.getDay(); if (w === 6 || w === 0) { var dd = new Date(d); dd.setDate(d.getDate() + (rule.dir === 'before' ? (w === 6 ? -1 : -2) : (w === 6 ? 2 : 1))); ds = fd(dd); } }
+    if (out.indexOf(ds) < 0) out.push(ds);
+  }
+  return out;
+}
+
+/* ======================= repeating bills ======================= */
+var RP=null, RPT=null;
+var WD_N=['Sunday','Monday','Tuesday','Wednesday','Thursday','Friday','Saturday'], NTH_N=['','1st','2nd','3rd','4th','last'];
+function myRepeats(){ return (S.data&&S.data.repeats)||[]; }
+function repeatFor(tab,name){ name=String(name||'').toLowerCase(); return myRepeats().filter(function(r){ return r.tab===tab && r.name.toLowerCase()===name; })[0]; }
+function rptText(r){ var u=r.rule||{}, n=+u.every||1, t;
+  if(u.unit==='week') t=n===1?'Weekly':n===2?'Fortnightly':'Every '+n+' weeks';
+  else if(u.unit==='day') t=n===1?'Daily':'Every '+n+' days';
+  else if(u.unit==='month') t=(n===1?'Monthly':n===3?'Every 3 months':'Every '+n+' months');
+  else t=n===1?'Yearly':'Every '+n+' years';
+  var sd=parseYmd(r.start);
+  if(u.unit==='week'||u.unit==='day'&&n%7===0) t+=' on '+WD_N[sd.getDay()]+'s';
+  if(u.unit==='month') t+=u.mode==='nth'?' on the '+NTH_N[u.nth]+' '+WD_N[u.wd]:' on the '+sd.getDate()+ordinal(sd.getDate());
+  if(u.wkday) t+=', weekdays only';
+  return t; }
+function ordinal(n){ return (n%100>=11&&n%100<=13)?'th':({1:'st',2:'nd',3:'rd'}[n%10]||'th'); }
+function rpLastDate(tabName){ var t=tabByName(tabName); return t&&t.days.length?t.days[t.days.length-1].date:''; }
+
+/* list of every repeating bill */
+function openRepeats(){
+  var list=myRepeats().slice().sort(function(a,b){ return a.name<b.name?-1:1; });
+  openSheet(sheetHead('Repeating bills')
+   +'<p class="note" style="margin:0 4px 10px">Bills and pays that repeat on their own: weekly, fortnightly, monthly, the 2nd Tuesday, whatever you need. Tap one to change the amount or the timing, or to stop it.</p>'
+   +'<button class="btn" onclick="closeSheet();setTimeout(function(){openRepeat()},300)">+ New repeating bill</button>'
+   +(list.length?'<div class="card" style="margin-top:14px">'+list.map(function(r,i){ var t=tabByName(r.tab), nx=rptDates(r.rule,r.start,r.endMode==='date'?r.until:rpLastDate(r.tab),r.endMode==='count'?r.count:800).filter(function(d){return d>=S.data.today;})[0];
+      return '<button class="tx" onclick="closeSheet();setTimeout(function(){openRepeat(myRepeats().filter(function(x){return x.id===\''+r.id+'\';})[0])},300)">'+logoHtml(r.name,'out')+'<span class="nm">'+esc(r.name)+'<small>'+esc(rptText(r))+(nx?' · next '+esc(dayLabel(nx)):' · finished')+'</small></span><span class="amt">'+money(r.amt,t)+'</span></button>'; }).join('')+'</div>'
+     :'<div class="card empty" style="margin-top:14px">No repeating bills yet.</div>')
+   +'</div><div class="ft"></div>');
+}
+
+/* create or edit one */
+function openRepeat(pre){
+  pre=pre||{}; var tab=pre.tab&&tabByName(pre.tab)?tabByName(pre.tab):pickTab(); if(!tab){ toast('Switch on a daily sheet first'); return; }
+  var start=pre.start||S.data.today, sd=parseYmd(start);
+  var col=pre.col!=null?+pre.col:(tab.layout.amounts.filter(function(c){return c.kind!=='in';})[0]||tab.layout.amounts[0]).i;
+  RP={id:pre.id||'', tab:tab.name, col:col, name:pre.name||'', amt:pre.amt?noteAmt(pre.amt):'', start:start,
+      rule:pre.rule?JSON.parse(JSON.stringify(pre.rule)):{unit:'week',every:2,mode:'date',nth:Math.min(5,Math.ceil(sd.getDate()/7)),wd:sd.getDay(),wkday:false,dir:'after'},
+      endMode:pre.endMode||'sheet', until:pre.until||'', count:pre.count||12, from:'', replace:!!pre.fromItem, fromItem:!!pre.fromItem, wasEdit:!!pre.id};
+  if(RP.wasEdit) RP.from=RP.start>S.data.today?RP.start:S.data.today;
+  openSheet(sheetHead(RP.wasEdit?'Edit repeating bill':'Repeating bill')+'<div id="rpBody"></div></div>'
+   +'<div class="ft"><div class="btnrow">'+(RP.wasEdit?'<button class="btn ghost" id="rpDel" onclick="rpDelete()">Stop it</button>':'')+'<button class="btn" id="rpBtn" onclick="rpSave()">'+(RP.wasEdit?'Save changes':'Add repeats')+'</button></div></div>');
+  rpDraw();
+}
+function rpPreset(k){ var sd=parseYmd(RP.start), u=RP.rule;
+  if(k==='w'){ u.unit='week'; u.every=1; } else if(k==='f'){ u.unit='week'; u.every=2; } else if(k==='m'){ u.unit='month'; u.every=1; } else { RP.custom=1; }
+  if(k!=='c') RP.custom=0; u.wd=sd.getDay(); u.nth=Math.min(5,Math.ceil(sd.getDate()/7)); rpDraw(); }
+function rpPresetKey(){ var u=RP.rule; if(RP.custom) return 'c'; if(u.unit==='week'&&+u.every===1) return 'w'; if(u.unit==='week'&&+u.every===2) return 'f'; if(u.unit==='month'&&+u.every===1) return 'm'; return 'c'; }
+function rpSet(k,v){ RP[k]=v; rpPrev(); }
+function rpRule(k,v){ RP.rule[k]=v; if(k==='unit'||k==='mode'||k==='wkday'||k==='dir') rpDraw(); else rpPrev(); }
+function rpDraw(){
+  var tab=tabByName(RP.tab), sd=parseYmd(RP.start), u=RP.rule, pk=rpPresetKey(), dom=sd.getDate(), nth=Math.ceil(dom/7), isLast=dom+7>new Date(sd.getFullYear(),sd.getMonth()+1,0).getDate();
+  var cols=tab.layout.amounts.map(function(c){ return [c.i,short(c.name)+(c.kind==='in'?' (in)':'')]; });
+  var h=fieldSel('rp_tab','Sheet',tabOpts(),RP.tab,'RP.tab=this.value;var t=tabByName(RP.tab);RP.col=(t.layout.amounts.filter(function(c){return c.kind!==\'in\';})[0]||t.layout.amounts[0]).i;rpDraw()')
+   +fieldIn('rp_name','Name (goes in the notes)',RP.name,'placeholder="e.g. Flo Spending" autocomplete="off" autocapitalize="words" oninput="rpSet(\'name\',this.value)"')
+   +'<div class="amountbox" style="margin-top:10px"><span class="cur">$</span><input id="rp_amt" inputmode="decimal" placeholder="0.00" value="'+esc(RP.amt)+'" oninput="rpSet(\'amt\',this.value)"></div>'
+   +fieldSel('rp_col','Column',cols,RP.col,'rpSet(\'col\',+this.value)')
+   +fieldIn('rp_start','First one',RP.start,'type="date" onchange="if(this.value){RP.start=this.value;var d=parseYmd(this.value);RP.rule.wd=d.getDay();RP.rule.nth=Math.min(5,Math.ceil(d.getDate()/7));rpDraw()}"')
+   +'<div class="lbl2">Repeats</div><div class="toggle2" style="grid-template-columns:repeat(4,1fr)">'+[['w','Weekly'],['f','Fortnightly'],['m','Monthly'],['c','Custom']].map(function(x){ return '<button class="'+(pk===x[0]?'on':'')+'" onclick="rpPreset(\''+x[0]+'\')">'+x[1]+'</button>'; }).join('')+'</div>';
+  if(pk==='c') h+='<div class="card" style="display:flex;align-items:center;gap:10px;padding:10px 14px;margin-top:-4px"><span>Every</span><input id="rp_every" inputmode="numeric" value="'+esc(u.every)+'" style="width:56px;text-align:center;font-size:16px;border:0;background:var(--chip-bg);border-radius:10px;padding:8px;color:var(--ink)" oninput="rpRule(\'every\',this.value)">'
+     +'<select style="flex:1;font-size:16px;border:0;background:var(--chip-bg);border-radius:10px;padding:9px;color:var(--ink);font-family:inherit" onchange="rpRule(\'unit\',this.value)">'+[['day','days'],['week','weeks'],['month','months'],['year','years']].map(function(o){ return '<option value="'+o[0]+'"'+(u.unit===o[0]?' selected':'')+'>'+o[1]+'</option>'; }).join('')+'</select></div>';
+  if(u.unit==='month'){
+    var opts=[['date','On the '+dom+ordinal(dom)],['nth','On the '+NTH_N[Math.min(4,nth)]+' '+WD_N[sd.getDay()]]]; if(isLast) opts.push(['last','On the last '+WD_N[sd.getDay()]]);
+    var cur=u.mode==='nth'?(+u.nth===5?'last':'nth'):'date';
+    h+='<div class="toggle2" style="grid-template-columns:repeat('+opts.length+',1fr)">'+opts.map(function(o){ return '<button class="'+(cur===o[0]?'on':'')+'" onclick="RP.rule.mode=\''+(o[0]==='date'?'date':'nth')+'\';RP.rule.nth='+(o[0]==='last'?5:Math.min(4,nth))+';RP.rule.wd='+sd.getDay()+';rpDraw()">'+o[1]+'</button>'; }).join('')+'</div>';
+  }
+  h+='<button class="toggle" style="width:100%;margin-top:4px" onclick="rpRule(\'wkday\',!RP.rule.wkday)"><span style="text-align:left">Weekdays only<small style="display:block;color:var(--ink3);font-weight:400;font-size:12px">If one lands on a weekend, move it to the '+(u.dir==='before'?'Friday before':'Monday after')+'</small></span><span class="sw'+(u.wkday?' on':'')+'"></span></button>';
+  if(u.wkday) h+='<div class="toggle2" style="margin-top:8px"><button class="'+(u.dir!=='before'?'on':'')+'" onclick="rpRule(\'dir\',\'after\')">Monday after</button><button class="'+(u.dir==='before'?'on':'')+'" onclick="rpRule(\'dir\',\'before\')">Friday before</button></div>';
+  h+='<div class="lbl2">Ends</div><div class="toggle2 toggle3">'+[['sheet','Never'],['date','On a date'],['count','After…']].map(function(x){ return '<button class="'+(RP.endMode===x[0]?'on':'')+'" onclick="RP.endMode=\''+x[0]+'\';rpDraw()">'+x[1]+'</button>'; }).join('')+'</div>';
+  if(RP.endMode==='date') h+=fieldIn('rp_until','Last one on or before',RP.until||addDays(RP.start,365),'type="date" onchange="rpSet(\'until\',this.value)"'), RP.until=RP.until||addDays(RP.start,365);
+  if(RP.endMode==='count') h+=fieldIn('rp_count','How many times',RP.count,'inputmode="numeric" oninput="rpSet(\'count\',this.value)"');
+  if(RP.wasEdit) h+=fieldIn('rp_from','Apply changes from',RP.from,'type="date" onchange="rpSet(\'from\',this.value)"')+'<p class="note" style="margin:6px 4px 0">Days before this date stay exactly as they are.</p>';
+  if(RP.fromItem) h+='<button class="toggle" style="width:100%;margin-top:10px" onclick="RP.replace=!RP.replace;this.querySelector(\'.sw\').classList.toggle(\'on\',RP.replace);rpPrev()"><span style="text-align:left">Replace the later ones already in the sheet<small style="display:block;color:var(--ink3);font-weight:400;font-size:12px">Removes any “'+esc(RP.name)+'” of the same amount from the first date on, then adds the new pattern</small></span><span class="sw'+(RP.replace?' on':'')+'"></span></button>';
+  h+='<div class="writes" id="rpPrev"></div>';
+  $('rpBody').innerHTML=h; rpPrev();
+}
+function rpSeries(){ return {id:RP.id,tab:RP.tab,col:RP.col,name:tidyName(RP.name),amt:num(RP.amt),start:RP.start,rule:RP.rule,endMode:RP.endMode,until:RP.until,count:RP.count}; }
+function rpPrev(){ var b=$('rpBtn'), s=rpSeries(), t=tabByName(RP.tab);
+  if(!s.name||!(s.amt>0)){ $('rpPrev').innerHTML='Add a name and amount to see the dates.'; if(b) b.disabled=true; return; }
+  var end=rpLastDate(RP.tab), until=s.endMode==='date'?s.until:end, from=RP.wasEdit?(RP.from||S.data.today):s.start;
+  var ds=rptDates(s.rule,s.start,until,s.endMode==='count'?s.count:800).filter(function(d){return d>=from;});
+  if(b) b.disabled=!ds.length;
+  if(!ds.length){ $('rpPrev').innerHTML='No dates fall in the sheet with these settings.'; return; }
+  var col=t.layout.amounts.filter(function(c){return c.i===+s.col;})[0];
+  $('rpPrev').innerHTML='<b>'+esc(rptText(s))+'</b>. '+ds.length+' date'+(ds.length===1?'':'s')+(s.endMode==='sheet'?' to the end of the sheet ('+esc(dayLabel(end))+')':'')+': '
+   +esc(ds.slice(0,5).map(dayLabel).join(', '))+(ds.length>5?'…':'')
+   +'.<br>Each one goes in <b>'+esc(short(col?col.name:''))+'</b> as <code>'+esc(s.name)+' ('+noteAmt(s.amt)+')</code>, the same way you’d type it.'+(RP.wasEdit?' The old dates from '+esc(dayLabel(from))+' on are replaced.':'');
+}
+function rpSave(){ var s=rpSeries(); busy('rpBtn','Saving…');
+  call('repeatSave',{series:s,from:RP.wasEdit?(RP.from||S.data.today):'',replace:RP.replace}).then(function(r){
+    if(S.data) S.data.repeats=r.items; closeSheet(); toast('Added '+r.added+' date'+(r.added===1?'':'s')+(r.removed?' (replaced '+r.removed+')':'')); boot(); })
+   .catch(function(e){ unbusy('rpBtn'); toast(cleanErr(e)); }); }
+function rpDelete(){ var b=$('rpDel');
+  if(!RP.armed){ RP.armed=1; b.textContent='Tap again to stop it'; b.style.color='var(--warn)'; toast('Removes it from '+dayLabel(RP.from||S.data.today)+' on. Earlier days stay.'); return; }
+  busy('rpDel','Stopping…');
+  call('repeatDelete',{id:RP.id,from:RP.from||S.data.today}).then(function(r){ if(S.data) S.data.repeats=r.items; closeSheet(); toast('Stopped. Removed '+r.removed+' upcoming date'+(r.removed===1?'':'s')); boot(); })
+   .catch(function(e){ unbusy('rpDel'); toast(cleanErr(e)); }); }
+function addToRepeat(){ var tab=tabByName(A.tab); closeSheet(); setTimeout(function(){ openRepeat({tab:A.tab,col:A.col,name:tidyName(A.name),amt:num(A.amount)||'',start:A.date}); },300); }
+function itRepeat(){ var r=repeatFor(IT.tab,IT.name); closeSheet(); setTimeout(function(){ if(r) openRepeat(r); else openRepeat({tab:IT.tab,name:IT.name,amt:IT.amt,start:IT.date,col:itCol(),fromItem:true}); },300); }
+function itCol(){ var tab=tabByName(IT.tab), day=tab.days.filter(function(d){return d.r===IT.row;})[0]; if(!day) return null;
+  var it=dayItems(tab,day).filter(function(i){ return i.name===IT.name && Math.abs((i.amt||0)-IT.amt)<0.005; })[0];
+  var c=it&&it.col?tab.layout.amounts.filter(function(a){return a.name===it.col;})[0]:null;
+  if(c) return c.i; var f=tab.layout.amounts.filter(function(a){ return a.note===IT.note && num(day.d[a.i])>=IT.amt-0.005; })[0]; return f?f.i:null; }
+
 /* ======================= quick actions ======================= */
-var QA_ICONS={"move": "<path d=\"M4 7h11\"/><path d=\"M12 3l4 4-4 4\"/><path d=\"M20 17H9\"/><path d=\"M12 13l-4 4 4 4\"/>", "rise": "<path d=\"M3 17l6-6 4 4 8-8\"/><path d=\"M15 7h6v6\"/>", "cal": "<rect x=\"3\" y=\"5\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M3 10h18M8 3v4M16 3v4\"/><path d=\"M8 15l2.5 2.5L16 13\"/>", "year": "<rect x=\"3\" y=\"5\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M3 10h18M8 3v4M16 3v4\"/><path d=\"M12 13v5M9.5 15.5h5\"/>", "new": "<rect x=\"4\" y=\"3\" width=\"16\" height=\"18\" rx=\"2\"/><path d=\"M12 9v6M9 12h6\"/>", "pen": "<path d=\"M4 20h4L19 9l-4-4L4 16v4z\"/><path d=\"M13.5 6.5l4 4\"/>"};
+var QA_ICONS={"rep": "<path d=\"M17 2l4 4-4 4\"/><path d=\"M3 11V9a3 3 0 0 1 3-3h15\"/><path d=\"M7 22l-4-4 4-4\"/><path d=\"M21 13v2a3 3 0 0 1-3 3H3\"/>", "move": "<path d=\"M4 7h11\"/><path d=\"M12 3l4 4-4 4\"/><path d=\"M20 17H9\"/><path d=\"M12 13l-4 4 4 4\"/>", "rise": "<path d=\"M3 17l6-6 4 4 8-8\"/><path d=\"M15 7h6v6\"/>", "cal": "<rect x=\"3\" y=\"5\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M3 10h18M8 3v4M16 3v4\"/><path d=\"M8 15l2.5 2.5L16 13\"/>", "year": "<rect x=\"3\" y=\"5\" width=\"18\" height=\"16\" rx=\"2\"/><path d=\"M3 10h18M8 3v4M16 3v4\"/><path d=\"M12 13v5M9.5 15.5h5\"/>", "new": "<rect x=\"4\" y=\"3\" width=\"16\" height=\"18\" rx=\"2\"/><path d=\"M12 9v6M9 12h6\"/>", "pen": "<path d=\"M4 20h4L19 9l-4-4L4 16v4z\"/><path d=\"M13.5 6.5l4 4\"/>"};
 function qaIcon(k){ return '<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">'+QA_ICONS[k]+'</svg>'; }
-var QA_LIST=[['openMovePick()','move','Move a bill'],['openBulk()','rise','Pay rise or new price'],['openWeekday()','cal','Weekday-only bills'],['openYear()','year','Plan a new year'],['withAdm(openNewTab)','new','New sheet'],['withAdm(openRename)','pen','Rename sheets']];
+var QA_LIST=[['openRepeats()','rep','Repeating bills'],['openMovePick()','move','Move a bill'],['openBulk()','rise','Pay rise or new price'],['openWeekday()','cal','Weekday-only bills'],['openYear()','year','Plan a new year'],['withAdm(openNewTab)','new','New sheet']];
+var MENU_TOOLS=QA_LIST.concat([['withAdm(openRename)','pen','Rename sheets']]);
 function qaHtml(){ if(!ledgers().length) return '';
   return '<div class="qa-h"><span>Tools</span></div><div class="qa">'+QA_LIST.map(function(q){ return '<button onclick="'+q[0]+'">'+qaIcon(q[1])+'<span>'+q[2]+'</span></button>'; }).join('')+'</div>'; }
 function withAdm(fn){ if(ADM){ fn(); return; } call('admin',{}).then(function(a){ ADM=a; fn(); }).catch(function(e){ toast(cleanErr(e)); }); }
@@ -1895,6 +2027,7 @@ function drawAdd(focus){
   h+='<div class="lbl2">When</div><div class="chips"><button class="chip '+(A.date===t?'on':'')+'" onclick="A.date=\''+t+'\';drawAdd()">Today</button>'
     +'<button class="chip '+(A.date===addDays(t,-1)?'on':'')+'" onclick="A.date=\''+addDays(t,-1)+'\';drawAdd()">Yesterday</button>'
     +'<label class="chip '+(other?'on':'')+'">'+(other?esc(dayLabel(A.date)):'Other day')+'<input type="date" value="'+A.date+'" onchange="if(this.value){A.date=this.value;drawAdd()}" style="position:absolute;inset:0;opacity:0;width:100%"></label></div>';
+  h+='<div class="lbl2">Repeat</div><div class="chips"><button class="chip on">Just once</button><button class="chip" onclick="addToRepeat()">\u21bb Weekly, fortnightly, monthly\u2026</button></div>';
   h+='<div class="writes" id="prev"></div>';
   $('addBody').innerHTML=h; upd();
   if(focus) setTimeout(function(){ var e=$('amt'); if(e) e.focus(); },320);
@@ -1995,7 +2128,7 @@ function openTheme(refresh){
 function openMenu(){
   openSheet('<div class="hd"><button onclick="closeSheet()">Close</button><b>Menu</b><span></span></div><div class="bd">'
     +'<div class="fl" style="margin:0 4px 8px;font-size:13px;color:var(--ink3);font-weight:600">Tools</div><div class="card">'
-    +QA_LIST.map(function(q){ return '<button class="row" onclick="closeSheet();setTimeout(function(){'+q[0]+'},300)"><span class="k" style="display:flex;align-items:center;gap:10px"><span style="width:22px;height:22px;display:inline-grid;color:var(--accent,var(--blue))">'+qaIcon(q[1])+'</span>'+q[2]+'</span><span class="s">\u203A</span></button>'; }).join('')+'</div>'
+    +MENU_TOOLS.map(function(q){ return '<button class="row" onclick="closeSheet();setTimeout(function(){'+q[0]+'},300)"><span class="k" style="display:flex;align-items:center;gap:10px"><span style="width:22px;height:22px;display:inline-grid;color:var(--accent,var(--blue))">'+qaIcon(q[1])+'</span>'+q[2]+'</span><span class="s">\u203A</span></button>'; }).join('')+'</div>'
     +'<div class="fl" style="margin:18px 4px 8px;font-size:13px;color:var(--ink3);font-weight:600">App</div><div class="card">'
     +'<button class="row" onclick="closeSheet();boot(true)"><span class="k">Refresh from the sheet</span><span class="s">\u203A</span></button>'
     +'<button class="row" onclick="closeSheet();setTimeout(function(){openTheme()},280)"><span class="k">Appearance</span><span class="s">'+esc((THEMES.filter(function(t){return t.k===themePref().t;})[0]||{}).n||'')+' \u00b7 '+({light:'Light',dark:'Dark',auto:'Auto'}[themePref().m])+' \u203A</span></button>'
@@ -2083,6 +2216,7 @@ function openHelp(){
    +'<h3>The Positive Goose</h3><p>Tap the goose for today\u2019s affirmation. Tap \u201CHonk for another\u201D for more.</p>'
    +'<h3>The little cards</h3><p>The cards icon in the bottom bar (with the PLAY tag) opens Last Card. Play 1 v 1 against the computer. Match the colour or number, use Skip, Reverse, +2 and Wilds, and tap \u201CLast card!\u201D before you go down to one card, or you pick up two.</p>'
    +'<h3>Find &amp; update a bill</h3><p>On Home, tap <b>Find &amp; update</b> and type a word like \u201Cinsurance\u201D or an amount. Pick one, change the amount (or name), and choose <b>Just this day</b> or <b>From a date on</b>. Days before that date are never touched. The app rewrites that day\u2019s cell and note in the same style you use, e.g. <code>=(147.02+212)</code> becomes <code>=(170+212)</code> and the note becomes <code>Paul Car Insurance (170)</code>.</p>'
+   +'<h3>Repeating bills</h3><p>Tools \u2192 <b>Repeating bills</b>, or tap <b>\u21bb Weekly, fortnightly, monthly\u2026</b> when adding, or <b>Make this repeat</b> on any bill. Pick the first date and how often (weekly, fortnightly, monthly on a date or a weekday like the 2nd Tuesday, or every few days, weeks or months). Each date is written into the sheet in your usual format. Change the amount or timing any time from a date, and earlier days stay as they are.</p>'
    +'<h3>Move something to another day</h3><p>Tap it (or find it with Find &amp; update), change the <b>Day</b> and tap <b>Move</b>. It comes out of the old day\u2019s amount and note and goes into the new day the same way.</p>'
    +'<h3>Weekday-only bills</h3><p>Settings \u2192 <b>Weekday-only bills</b>. Add the bills your bank only pays on weekdays. Any that land on a Saturday or Sunday move to the Monday after (or Friday before), and it checks again every day.</p>'
    +'<h3>Pay rise or new price</h3><p>Settings \u2192 <b>Change a regular amount</b>. Pick the column, the old and new amount and the date it starts. Only those days change; everything before stays.</p>'
@@ -2133,7 +2267,7 @@ var Mock=(function(){
     ownerPin:cfg.ownerPin, logos:logos, tabs:Object.keys(tabsOn).map(function(n){return {name:n,on:tabsOn[n]};}), sheetUrl:''}; }
   return { api:function(action,pin,p){
     var role='owner';
-    if(action==='bootstrap') return {logos:logos, role:role, appName:cfg.appName, partnerName:cfg.partnerName, ownerName:cfg.ownerName, canEdit:role==='owner'||cfg.canEdit, canDelete:false, access:cfg.access, today:today, tabs:visible().map(strip)};
+    if(action==='bootstrap') return {logos:logos, role:role, appName:cfg.appName, partnerName:cfg.partnerName, ownerName:cfg.ownerName, canEdit:role==='owner'||cfg.canEdit, canDelete:false, access:cfg.access, today:today, repeats:cfg.repeats||[], tabs:visible().map(strip)};
     if(action==='admin'){ return adminOut(); }
     if(action==='saveAdmin'){
       ['access','canEdit','partnerName','ownerName','appName'].forEach(function(k){ if(k in p) cfg[k]=typeof cfg[k]==='boolean'?!!p[k]:String(p[k]).trim()||cfg[k]; });
@@ -2168,6 +2302,12 @@ var Mock=(function(){
     if(action==='weekdaySave'){ cfg.weekday=p.names; cfg.wkdir=p.dir; return {cfg:{names:p.names,dir:p.dir},moved:[],failed:[]}; }
     if(action==='bulkChange'){ var ds=t.days.filter(function(d){ return d.date>=p.from&&(!p.to||d.date<=p.to)&&Math.abs(num(d.d[p.col])-p.oldAmt)<0.005; }).map(function(d){return d.date;}); return {count:ds.length,dates:ds}; }
     if(action==='planYear'){ return {year:p.year,added:0,items:p.dryRun?[{key:'a',name:'Car Loan',named:true,amt:110,when:'every week on Sundays',count:52,already:0,pick:true},{key:'b',name:'Income Amount',named:false,amt:3623.69,when:'every fortnight on Fridays',count:26,already:0,pick:true},{key:'c',name:'Paul Car Insurance',named:true,amt:147.02,when:'monthly on the 7th',count:12,already:0,pick:true},{key:'d',name:'Paul Rego',named:true,amt:242.46,when:'once a year (24 Oct)',count:1,already:0,pick:false}]:[]}; }
+    if(action==='repeatList') return {items:cfg.repeats||[]};
+    if(action==='repeatSave'){ var sr=p.series, lt=t||ledgersAll.filter(function(x){return x.name===sr.tab;})[0], end=lt.days[lt.days.length-1].date, from=p.from||sr.start;
+      var ds=rptDates(sr.rule,sr.start,sr.endMode==='date'?sr.until:end,sr.endMode==='count'?sr.count:800).filter(function(d){return d>=from;}), added=0;
+      ds.forEach(function(d){ try{ Mock.api('addSpend','',{tab:sr.tab,date:d,col:+sr.col,amount:sr.amt,name:sr.name}); added++; }catch(e){} });
+      cfg.repeats=(cfg.repeats||[]).filter(function(x){return x.id!==sr.id;}); if(!sr.id) sr.id='r'+Date.now(); cfg.repeats.push(sr); return {added:added,removed:0,series:sr,items:cfg.repeats}; }
+    if(action==='repeatDelete'){ cfg.repeats=(cfg.repeats||[]).filter(function(x){return x.id!==p.id;}); return {removed:0,items:cfg.repeats}; }
     if(action==='moveItem'||action==='createTab'||action==='renameTabs') throw new Error('Preview only: this changes the real sheet');
     throw new Error('Not in preview');
   }};
