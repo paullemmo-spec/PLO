@@ -143,6 +143,17 @@ function api(action, pin, payload) {
     case 'addSpend':  return addSpend_(ctx, payload);
     case 'saveDay':   return saveDay_(ctx, payload);
     case 'editItems': return editItems_(ctx, payload);
+    case 'moveItem':  return moveItem_(ctx, payload);
+    case 'bulkChange': return bulkChange_(ctx, payload);
+    case 'weekdayGet': return { cfg: weekdayCfg_(), found: weekendFix_(ctx, { dryRun: true }).moved };
+    case 'weekdaySave': return weekdaySave_(ctx, payload);
+    case 'createTab': return createTab_(ctx, payload);
+    case 'renameTabs': return renameTabs_(ctx, payload);
+    case 'planYear':  return planYear_(ctx, payload);
+    case 'repeatList': return { items: repeatsOut_(ctx) };
+    case 'nameAmount': return nameAmount_(ctx, payload);
+    case 'repeatSave': return repeatSave_(ctx, payload);
+    case 'repeatDelete': return repeatDelete_(ctx, payload);
     case 'addRow':    return addRow_(ctx, payload.tab, payload.values);
     case 'updateRow': return updateRow_(ctx, payload.tab, payload.row, payload.values, payload.expect);
     case 'deleteRow': return deleteRow_(ctx, payload.tab, payload.row, payload.expect);
@@ -348,6 +359,7 @@ function tabFor_(ctx, name) {
 
 function bootstrap_(ctx, p) {
   const quick = !!(p && p.quick);
+  autoWeekendFix_(ctx);
   const s = ctx.s, ss = SpreadsheetApp.getActive(), tz = ss.getSpreadsheetTimeZone();
   const tabs = [];
   s.tabs.forEach(t => {
@@ -368,6 +380,7 @@ function bootstrap_(ctx, p) {
     today: Utilities.formatDate(new Date(), tz, 'yyyy-MM-dd'),
     logos: s.logos,
     quick: quick,
+    repeats: repeatsOut_(ctx),
     tabs: tabs
   };
   if (quick) cachePut_('quick', out);
@@ -549,7 +562,8 @@ function addSpend_(ctx, p) {
   const t = tabFor_(ctx, p.tab);
   const amount = Math.round(parseFloat(p.amount) * 100) / 100;
   if (!(amount > 0)) throw new Error('Enter an amount');
-  if (p.name) p.name = tidyName_(p.name);
+  if (p.name && !p.keepName) p.name = tidyName_(p.name);
+  const parts = (p.terms && p.terms.length > 1) ? p.terms.map(x => Math.round(parseFloat(x) * 100) / 100).filter(x => x > 0) : [amount];
   const lock = LockService.getDocumentLock();
   lock.waitLock(20000);
   try {
@@ -562,9 +576,9 @@ function addSpend_(ctx, p) {
 
     // 1) Money cell: blank → 45.26 ; 70 → =SUM(70+45.26) ; =SUM(70+10) → =SUM(70+10+45.26)
     const cell = sh.getRange(row, col.i + 1);
-    const f = cell.getFormula(), a = noteAmt_(amount);
+    const f = cell.getFormula(), a = parts.map(noteAmt_).join('+');
     const pm = parseMoney_(f, cell.getValue());
-    if (pm) { pm.terms.push(amount); writeTerms_(cell, pm); }
+    if (pm) { if (!pm.style && pm.terms.length + parts.length > 1) pm.style = colStyle_(sh, hi, col.i); parts.forEach(x => pm.terms.push(x)); writeTerms_(cell, pm); }
     else if (f) cell.setFormula('=SUM((' + f.slice(1) + ')+' + a + ')');   // unusual formula: wrap it safely
     else cell.setValue(amount);
     // Keep the money format the column already uses.
@@ -681,7 +695,7 @@ function editItems_(ctx, p) {
   try {
     const sh = t.sh, hi = headerInfo_(sh, t.headerRow), L = ledgerLayout_(sh, hi);
     if (!L) throw new Error('This tab is not a daily ledger');
-    let done = 0;
+    let done = 0; const found = [];
     (p.items || []).forEach(it => {
       const row = parseInt(it.row, 10), noteCol = parseInt(it.note, 10);
       if (!(row > hi.headerRow)) throw new Error('Bad row');
@@ -712,6 +726,7 @@ function editItems_(ctx, p) {
       const newAmt = remove ? 0 : Math.round(parseFloat(it.newAmt) * 100) / 100;
       at.sort((a, b) => b - a).forEach((q, n) => { if (n === at.length - 1 && !remove) terms[q] = newAmt; else terms.splice(q, 1); });
       pm.terms = terms;
+      found.push({ col: target.i, terms: itemTerms.length ? itemTerms : [oldAmt] });
       writeTerms_(sh.getRange(row, target.i + 1), pm);
       if (remove) parts.splice(idx, 1);
       else parts[idx] = (String(it.newName || it.name).trim()) + ' (' + noteAmt_(newAmt) + ')';
@@ -719,7 +734,7 @@ function editItems_(ctx, p) {
       done++;
     });
     SpreadsheetApp.flush();
-    return { done: done };
+    return { done: done, found: found };
   } finally {
     lock.releaseLock();
   }
@@ -923,4 +938,589 @@ function colIndex_(letters) {
   let n = 0;
   for (let i = 0; i < letters.length; i++) n = n * 26 + (letters.charCodeAt(i) - 64);
   return n - 1;
+}
+
+
+/* ============================ PLANNING TOOLS ============================ */
+/* Move a bill to another day, keep weekday-only bills off weekends, change a regular
+   amount from a date, add a new sheet, rename sheets, and fill a new year with the
+   regular bills. Everything is written in the same style you type by hand. */
+
+const DAY_NAMES = ['Sunday', 'Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+function r2_(x) { return Math.round(parseFloat(x) * 100) / 100; }
+function ymdOf_(d, tz) { return Utilities.formatDate(d, tz, 'yyyy-MM-dd'); }
+function dt_(s) { const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s)); if (!m) throw new Error('Pick a date'); return new Date(+m[1], +m[2] - 1, +m[3], 12); }
+function ymd_(d) { return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
+function plusDays_(s, n) { const d = dt_(s); d.setDate(d.getDate() + n); return ymd_(d); }
+function daysApart_(a, b) { return Math.round((dt_(b) - dt_(a)) / 86400000); }
+function dowOf_(s) { return dt_(s).getDay(); }
+function colLetter2_(i) { let n = i + 1, s = ''; while (n > 0) { const m = (n - 1) % 26; s = String.fromCharCode(65 + m) + s; n = Math.floor((n - 1) / 26); } return s; }
+
+function ledgerFor_(ctx, tabName) {
+  const t = tabFor_(ctx, tabName);
+  const sh = t.sh, hi = headerInfo_(sh, t.headerRow), L = ledgerLayout_(sh, hi);
+  if (!L) throw new Error('"' + tabName + '" isn’t a daily tab');
+  return { sh: sh, hi: hi, L: L, tz: SpreadsheetApp.getActive().getSpreadsheetTimeZone() };
+}
+
+/** How this column writes several amounts: =(a+b), =sum(a+b), =SUM(a+b) or =a+b. Uses whatever you use most. */
+function colStyle_(sh, hi, ci) {
+  const n = hi.lastRow - hi.headerRow; if (n < 1) return '=SUM(';
+  const fs = sh.getRange(hi.headerRow + 1, ci + 1, n, 1).getFormulas(), count = {};
+  fs.forEach(r => { const pm = r[0] ? parseMoney_(r[0], '') : null; if (pm && pm.style) count[pm.style] = (count[pm.style] || 0) + 1; });
+  let best = '=SUM(', bn = 0; Object.keys(count).forEach(k => { if (count[k] > bn) { bn = count[k]; best = k; } });
+  return best;
+}
+
+/** Splits one row into items: named ones from the note ("Car Loan (110)") matched to their column, and plain amounts with no note (like a wage). */
+function rowItems_(L, pms, notes) {
+  const rem = {}, items = [];
+  L.amounts.forEach(a => { rem[a.i] = pms[a.i] ? pms[a.i].terms.slice() : []; });
+  L.notes.forEach(nt => {
+    splitNote_(notes[nt.i]).forEach(pt => {
+      const m = /^(.*?)\s*\(([^()]*)\)\s*$/.exec(pt); if (!m) return;
+      const name = m[1].trim(), terms = m[2].split('+').map(x => parseFloat(x)).filter(x => !isNaN(x) && x > 0);
+      if (!name || !terms.length) return;
+      const amt = r2_(terms.reduce((a, b) => a + b, 0));
+      const cols = L.amounts.filter(a => a.note === nt.i);
+      for (const a of cols) {
+        const r = rem[a.i];
+        const k = r.findIndex(x => Math.abs(x - amt) < 0.005);
+        if (k >= 0) { r.splice(k, 1); items.push({ name: name, amt: amt, terms: terms, col: a.i }); return; }
+        const used = []; let ok = terms.length > 1;
+        terms.forEach(x => { const j = r.findIndex((y, q) => used.indexOf(q) < 0 && Math.abs(y - x) < 0.005); if (j < 0) ok = false; else used.push(j); });
+        if (ok) { used.sort((a2, b2) => b2 - a2).forEach(q => r.splice(q, 1)); items.push({ name: name, amt: amt, terms: terms, col: a.i }); return; }
+      }
+    });
+  });
+  L.amounts.forEach(a => rem[a.i].forEach(x => { if (x > 0) items.push({ name: '', amt: r2_(x), terms: [r2_(x)], col: a.i }); }));
+  return items;
+}
+
+/** Reads a block of day rows: dates, money cells and notes. */
+function readBlock_(X, fromRow, n) {
+  const sh = X.sh, L = X.L, width = X.hi.width || sh.getLastColumn();
+  const rg = sh.getRange(fromRow, 1, n, width), vals = rg.getValues(), fms = rg.getFormulas();
+  return vals.map((v, i) => {
+    const d = v[L.date];
+    const pms = {}, notes = {};
+    L.amounts.forEach(a => { pms[a.i] = parseMoney_(fms[i][a.i], v[a.i]); });
+    L.notes.forEach(nt => { notes[nt.i] = String(v[nt.i] || ''); });
+    return { r: fromRow + i, date: d instanceof Date ? ymdOf_(d, X.tz) : '', pms: pms, notes: notes, v: v, f: fms[i] };
+  });
+}
+
+/* ---------------- move a bill to another day ---------------- */
+function moveItem_(ctx, p) {
+  const amt = r2_(p.amt), to = String(p.date || '');
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(to)) throw new Error('Pick the new date');
+  const X = ledgerFor_(ctx, p.tab);
+  const fromDate = ymdOf_(X.sh.getRange(parseInt(p.row, 10), X.L.date + 1).getValue(), X.tz);
+  findDateRow_(X.sh, X.hi, X.L, to, X.tz);            // make sure the new day exists before touching anything
+  const newAmt = p.newAmt != null && p.newAmt !== '' ? r2_(p.newAmt) : amt;
+  const name = String(p.newName || p.name).trim() || p.name;
+  const r = editItems_(ctx, { tab: p.tab, items: [{ row: p.row, note: p.note, name: p.name, oldAmt: amt, remove: true }] });
+  const f = r.found[0];
+  const terms = newAmt === amt ? f.terms : [newAmt];
+  try {
+    addSpend_(ctx, { tab: p.tab, date: to, col: f.col, amount: newAmt, terms: terms, name: name, keepName: true });
+  } catch (e) {
+    try { addSpend_(ctx, { tab: p.tab, date: fromDate, col: f.col, amount: amt, terms: f.terms, name: p.name, keepName: true }); } catch (e2) {}
+    throw e;
+  }
+  return { ok: true, from: fromDate, to: to };
+}
+
+/* ---------------- weekday-only bills ---------------- */
+function weekdayCfg_() {
+  try { const c = JSON.parse(PropertiesService.getScriptProperties().getProperty('weekdayBills') || '{}'); c.names = c.names || []; c.dir = c.dir || 'after'; return c; }
+  catch (e) { return { names: [], dir: 'after' }; }
+}
+function weekdaySave_(ctx, p) {
+  const cfg = { names: (p.names || []).map(x => String(x).trim()).filter(Boolean).slice(0, 300), dir: p.dir === 'before' ? 'before' : 'after' };
+  const pr = PropertiesService.getScriptProperties();
+  pr.setProperty('weekdayBills', JSON.stringify(cfg));
+  const r = weekendFix_(ctx, {});
+  pr.setProperty('weekdayFixed', ymdOf_(new Date(), SpreadsheetApp.getActive().getSpreadsheetTimeZone()));
+  return { cfg: cfg, moved: r.moved, failed: r.failed };
+}
+function shiftWeekday_(ds, dir, today) {
+  const w = dowOf_(ds); if (w !== 0 && w !== 6) return ds;
+  if (dir === 'before') { const b = plusDays_(ds, w === 6 ? -1 : -2); if (!today || b >= today) return b; }
+  return plusDays_(ds, w === 6 ? 2 : 1);
+}
+/** Finds weekday-only bills that land on a Saturday or Sunday from today on, and moves them to the Monday after (or Friday before). */
+function weekendFix_(ctx, p) {
+  const cfg = weekdayCfg_(), names = cfg.names.map(x => x.toLowerCase());
+  const list = [], moved = [], failed = [];
+  if (!names.length) return { moved: [], failed: [] };
+  ctx.s.tabs.filter(t => t.on).forEach(t => {
+    let X; try { X = ledgerFor_(ctx, t.name); } catch (e) { return; }
+    const today = ymdOf_(new Date(), X.tz), first = X.hi.headerRow + 1, n = X.hi.lastRow - X.hi.headerRow;
+    if (n < 1) return;
+    const dates = X.sh.getRange(first, X.L.date + 1, n, 1).getValues();
+    X.L.notes.forEach(nt => {
+      const notes = X.sh.getRange(first, nt.i + 1, n, 1).getValues();
+      for (let i = 0; i < n; i++) {
+        const d = dates[i][0]; if (!(d instanceof Date)) continue;
+        const ds = ymdOf_(d, X.tz); if (ds < today) continue;
+        const w = dowOf_(ds); if (w !== 0 && w !== 6) continue;
+        splitNote_(notes[i][0]).forEach(pt => {
+          const m = /^(.*?)\s*\(([^()]*)\)\s*$/.exec(pt); if (!m) return;
+          const nm = m[1].trim(); if (names.indexOf(nm.toLowerCase()) < 0) return;
+          const amt = evalSimple_(m[2]); if (!(amt > 0)) return;
+          list.push({ tab: t.name, row: first + i, note: nt.i, name: nm, amt: amt, from: ds, date: shiftWeekday_(ds, cfg.dir, today) });
+        });
+      }
+    });
+  });
+  if (p.dryRun) return { moved: list, failed: [] };
+  list.forEach(x => { try { moveItem_(ctx, x); moved.push(x); } catch (e) { x.error = String(e.message || e); failed.push(x); } });
+  return { moved: moved, failed: failed };
+}
+function autoWeekendFix_(ctx) {
+  try {
+    const pr = PropertiesService.getScriptProperties();
+    const today = ymdOf_(new Date(), SpreadsheetApp.getActive().getSpreadsheetTimeZone());
+    if (pr.getProperty('weekdayFixed') === today || !weekdayCfg_().names.length) return;
+    pr.setProperty('weekdayFixed', today);
+    weekendFix_(ctx, {});
+  } catch (e) {}
+}
+
+/* ---------------- change a regular amount from a date (e.g. a pay rise) ---------------- */
+function bulkChange_(ctx, p) {
+  requireEdit_(ctx);
+  const X = ledgerFor_(ctx, p.tab), L = X.L, sh = X.sh;
+  const col = L.amounts.filter(a => a.i === Number(p.col))[0]; if (!col) throw new Error('Pick a column');
+  const oldAmt = r2_(p.oldAmt), newAmt = p.remove ? 0 : r2_(p.newAmt);
+  if (!(oldAmt > 0)) throw new Error('Enter the current amount');
+  if (!p.remove && !(newAmt > 0)) throw new Error('Enter the new amount');
+  const from = String(p.from || ''), to = String(p.to || '') || '9999-12-31';
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(from)) throw new Error('Pick the date it starts');
+  const nameF = String(p.name || '').trim().toLowerCase(), newName = String(p.newName || '').trim();
+  const lock = LockService.getDocumentLock(); lock.waitLock(20000);
+  try {
+    const first = X.hi.headerRow + 1, n = X.hi.lastRow - X.hi.headerRow;
+    const rows = readBlock_(X, first, n), hits = [];
+    rows.forEach(rw => {
+      if (!rw.date || rw.date < from || rw.date > to) return;
+      const pm = rw.pms[col.i]; if (!pm) return;
+      const k = pm.terms.findIndex(x => Math.abs(x - oldAmt) < 0.005); if (k < 0) return;
+      let parts = null, pi = -1;
+      if (col.note !== -1) {
+        parts = splitNote_(rw.notes[col.note]);
+        pi = parts.findIndex(pt => { const m = /^(.*?)\s*\(([^()]*)\)\s*$/.exec(pt);
+          return m && Math.abs((evalSimple_(m[2]) || 0) - oldAmt) < 0.005 && (!nameF || m[1].trim().toLowerCase() === nameF); });
+      }
+      if (nameF && pi < 0) return;      // a name was given: only change days where that name is in the note
+      hits.push({ rw: rw, pm: pm, k: k, parts: parts, pi: pi });
+    });
+    if (p.dryRun) return { count: hits.length, dates: hits.map(h => h.rw.date) };
+    hits.forEach(h => {
+      if (p.remove) h.pm.terms.splice(h.k, 1); else h.pm.terms[h.k] = newAmt;
+      writeTerms_(sh.getRange(h.rw.r, col.i + 1), h.pm);
+      if (h.pi >= 0) {
+        const m = /^(.*?)\s*\(([^()]*)\)\s*$/.exec(h.parts[h.pi]);
+        if (p.remove) h.parts.splice(h.pi, 1); else h.parts[h.pi] = (newName || m[1].trim()) + ' (' + noteAmt_(newAmt) + ')';
+        sh.getRange(h.rw.r, col.note + 1).setValue(h.parts.join(' / '));
+      }
+    });
+    SpreadsheetApp.flush();
+    return { count: hits.length, dates: hits.map(h => h.rw.date) };
+  } finally { lock.releaseLock(); }
+}
+
+/* ---------------- more day rows (used by new sheets and new years) ---------------- */
+function extendRows_(sh, hi, L, until, tz) {
+  let last = sh.getLastRow();
+  while (last > hi.headerRow && !(sh.getRange(last, L.date + 1).getValue() instanceof Date)) last--;
+  if (last <= hi.headerRow) throw new Error('No dated rows to continue from');
+  const lastYmd = ymdOf_(sh.getRange(last, L.date + 1).getValue(), tz), need = daysApart_(lastYmd, until);
+  if (need <= 0) return 0;
+  const oldMax = sh.getMaxRows();
+  if (oldMax < last + need) sh.insertRowsAfter(oldMax, last + need - oldMax);
+  const width = sh.getLastColumn();
+  sh.getRange(last, 1, 1, width).copyTo(sh.getRange(last + 1, 1, need, width), SpreadsheetApp.CopyPasteType.PASTE_FORMAT, false);
+  const dc = colLetter2_(L.date), dates = [], names = [];
+  for (let i = 1; i <= need; i++) { dates.push(['=' + dc + (last + i - 1) + '+1']); names.push([DAY_NAMES[dowOf_(plusDays_(lastYmd, i))]]); }
+  sh.getRange(last + 1, L.date + 1, need, 1).setFormulas(dates);
+  if (L.day !== -1) sh.getRange(last + 1, L.day + 1, need, 1).setValues(names);
+  sh.getRange(last, L.run + 1).copyTo(sh.getRange(last + 1, L.run + 1, need, 1));   // same Running Total formula, moved down
+  // stretch the colour bands to cover the new rows
+  const newMax = sh.getMaxRows();
+  if (newMax > oldMax) {
+    const rules = sh.getConditionalFormatRules().map(rule => {
+      const rs = rule.getRanges().map(g => g.getLastRow() >= oldMax - 1 ? sh.getRange(g.getRow(), g.getColumn(), newMax - g.getRow() + 1, g.getNumColumns()) : g);
+      return rule.copy().setRanges(rs).build();
+    });
+    sh.setConditionalFormatRules(rules);
+  }
+  return need;
+}
+
+/* ---------------- new sheet, same layout ---------------- */
+function createTab_(ctx, p) {
+  requireEdit_(ctx);
+  const ss = SpreadsheetApp.getActive(), name = String(p.name || '').trim();
+  if (!name) throw new Error('Give the new sheet a name');
+  if (/[\[\]*?:\/\\]/.test(name) || name.length > 90) throw new Error('Sheet names can’t use [ ] * ? : / \\');
+  if (ss.getSheetByName(name)) throw new Error('There’s already a sheet called "' + name + '"');
+  const X = ledgerFor_(ctx, p.from);
+  const start = String(p.start || ''); dt_(start);
+  const years = Math.max(1, Math.min(5, parseInt(p.years, 10) || 2));
+  const end = plusDays_(ymd_(new Date(dt_(start).getFullYear() + years, dt_(start).getMonth(), dt_(start).getDate(), 12)), -1);
+  const lock = LockService.getDocumentLock(); lock.waitLock(20000);
+  try {
+    const sh = X.sh.copyTo(ss).setName(name);
+    ss.setActiveSheet(sh); ss.moveActiveSheet(X.sh.getIndex() + 1);
+    const hi = headerInfo_(sh, X.hi.headerRow), L = ledgerLayout_(sh, hi);
+    const first = hi.headerRow + 1;
+    let lastRow = sh.getLastRow();
+    const n = Math.max(1, lastRow - first + 1);
+    L.amounts.concat(L.notes).forEach(c => sh.getRange(first, c.i + 1, n, 1).clearContent());
+    const lastUsed = Math.max.apply(null, [L.run, L.date].concat(L.amounts.map(a => a.i), L.notes.map(x => x.i)));
+    if (sh.getMaxColumns() > lastUsed + 1) sh.getRange(1, lastUsed + 2, sh.getMaxRows(), sh.getMaxColumns() - lastUsed - 1).clear();
+    if (!p.colours) sh.setConditionalFormatRules([]);
+    // first day: the start date and opening balance; every other day follows from it
+    sh.getRange(first, L.date + 1).setValue(dt_(start));
+    sh.getRange(first, L.run + 1).setValue(r2_(p.opening || 0));
+    const want = daysApart_(start, end) + 1;
+    if (n > want) sh.getRange(first + want, 1, n - want, sh.getMaxColumns()).clearContent();
+    SpreadsheetApp.flush();
+    if (n < want) extendRows_(sh, hi, L, end, X.tz);
+    if (L.day !== -1) {
+      const names = []; for (let i = 0; i < want; i++) names.push([DAY_NAMES[dowOf_(plusDays_(start, i))]]);
+      sh.getRange(first, L.day + 1, want, 1).setValues(names);
+    }
+    SpreadsheetApp.flush();
+  } finally { lock.releaseLock(); }
+  const s = getSettings_();                 // adds the new sheet to App Settings
+  saveAdmin_({ role: 'owner', s: s }, { tabs: { [name]: true } });
+  return admin_(auth_());
+}
+
+/* ---------------- rename sheets ---------------- */
+function renameTabs_(ctx, p) {
+  requireEdit_(ctx);
+  const ss = SpreadsheetApp.getActive();
+  (p.renames || []).forEach(r => {
+    const sh = ss.getSheets().filter(x => String(x.getSheetId()) === String(r.id))[0];
+    const nn = String(r.name || '').trim();
+    if (!sh || !nn || sh.getName() === nn || sh.getName() === SETTINGS_SHEET) return;
+    if (/[\[\]*?:\/\\]/.test(nn)) throw new Error('Sheet names can’t use [ ] * ? : / \\');
+    if (ss.getSheetByName(nn)) throw new Error('There’s already a sheet called "' + nn + '"');
+    sh.setName(nn);
+  });
+  SpreadsheetApp.flush();
+  return admin_(auth_());
+}
+
+/* ---------------- fill a new year with the regular bills ---------------- */
+function seriesOf_(occ) {
+  // occ: [{date, amt, terms}] sorted. Works out how often it repeats.
+  const ds = occ.map(o => o.date), n = ds.length;
+  if (n === 1) return { every: 'year', md: ds[0].slice(5) };
+  const gaps = []; for (let i = 1; i < n; i++) gaps.push(daysApart_(ds[i - 1], ds[i]));
+  const share = (lo, hi) => gaps.filter(g => g >= lo && g <= hi).length / gaps.length;
+  if (n >= 3 && share(6, 8) >= 0.7) return { every: 'week', days: 7 };
+  if (n >= 3 && share(13, 15) >= 0.7) return { every: 'fortnight', days: 14 };
+  if (n >= 3 && share(27, 29) >= 0.7 && share(30, 31) < 0.3) return { every: '4 weeks', days: 28 };
+  if (n >= 3 && share(26, 34) >= 0.7) {
+    const c = {}; ds.forEach(d => { const k = +d.slice(8); c[k] = (c[k] || 0) + 1; });
+    let dom = 1, b = 0; Object.keys(c).forEach(k => { if (c[k] > b || (c[k] === b && +k < dom)) { b = c[k]; dom = +k; } });
+    return { every: 'month', dom: dom };
+  }
+  if (n >= 2 && share(85, 97) >= 0.7) { return { every: 'quarter', dom: +ds[n - 1].slice(8) }; }
+  return null;
+}
+function projectDates_(sr, last, from, to) {
+  const out = [];
+  if (sr.days) { let d = plusDays_(last, sr.days); while (d <= to) { if (d >= from) out.push(d); d = plusDays_(d, sr.days); } return out; }
+  const y = +from.slice(0, 4);
+  const at = (yy, mm, dd) => { const dim = new Date(yy, mm, 0).getDate(); return yy + '-' + ('0' + mm).slice(-2) + '-' + ('0' + Math.min(dd, dim)).slice(-2); };
+  if (sr.every === 'month') { for (let m = 1; m <= 12; m++) { const d = at(y, m, sr.dom); if (d >= from && d <= to && d > last) out.push(d); } return out; }
+  if (sr.every === 'quarter') { const lm = +last.slice(5, 7); for (let k = 1; k <= 8; k++) { const t = lm + 3 * k, yy = +last.slice(0, 4) + Math.floor((t - 1) / 12), mm = ((t - 1) % 12) + 1; const d = at(yy, mm, sr.dom); if (d >= from && d <= to) out.push(d); } return out; }
+  if (sr.every === 'year') { const d = at(y, +sr.md.slice(0, 2), +sr.md.slice(3)); if (d >= from && d <= to) out.push(d); return out; }
+  return out;
+}
+function planYear_(ctx, p) {
+  requireEdit_(ctx);
+  const X = ledgerFor_(ctx, p.tab), L = X.L;
+  const year = parseInt(p.year, 10); if (!(year > 2000 && year < 2100)) throw new Error('Pick a year');
+  const sFrom = (year - 1) + '-01-01', sTo = (year - 1) + '-12-31', tFrom = year + '-01-01', tTo = year + '-12-31';
+  const cfg = weekdayCfg_(), wk = cfg.names.map(x => x.toLowerCase());
+  const lock = LockService.getDocumentLock(); lock.waitLock(25000);
+  try {
+    if (!p.dryRun) extendRows_(X.sh, X.hi, L, tTo, X.tz);
+    X.hi = headerInfo_(X.sh, X.hi.headerRow);
+    const first = X.hi.headerRow + 1, rows = readBlock_(X, first, X.hi.lastRow - X.hi.headerRow);
+    const groups = {}, existing = {};
+    rows.forEach(rw => {
+      if (!rw.date) return;
+      const inSrc = rw.date >= sFrom && rw.date <= sTo, inTgt = rw.date >= tFrom && rw.date <= tTo;
+      if (!inSrc && !inTgt) return;
+      rowItems_(L, rw.pms, rw.notes).forEach(it => {
+        const key = it.name ? 'n|' + it.name.toLowerCase() + '|' + it.col : 'u|' + it.col + '|' + it.amt;
+        if (inSrc) { (groups[key] = groups[key] || { key: key, name: it.name, col: it.col, occ: [] }).occ.push({ date: rw.date, amt: it.amt, terms: it.terms }); }
+        else (existing[key] = existing[key] || []).push(rw.date);
+      });
+    });
+    const plan = [];
+    Object.keys(groups).forEach(k => {
+      const g = groups[k]; g.occ.sort((a, b) => a.date < b.date ? -1 : 1);
+      const sr = seriesOf_(g.occ); if (!sr) return;
+      const lastO = g.occ[g.occ.length - 1];
+      const isWk = g.name && wk.indexOf(g.name.toLowerCase()) >= 0;
+      let ds = projectDates_(sr, lastO.date, tFrom, tTo).map(d => isWk ? shiftWeekday_(d, cfg.dir) : d);
+      const have = existing[k] || [];
+      ds = ds.filter(d => !have.some(h => Math.abs(daysApart_(h, d)) <= 3));
+      const already = have.length;
+      if (!ds.length && !already) return;
+      const colName = (L.amounts.filter(a => a.i === g.col)[0] || {}).name || '';
+      const when = sr.every === 'week' || sr.every === 'fortnight' ? 'every ' + sr.every + ' on ' + DAY_NAMES[dowOf_(lastO.date)] + 's'
+        : sr.every === '4 weeks' ? 'every 4 weeks' : sr.every === 'month' ? 'monthly on the ' + sr.dom + ordinal_(sr.dom)
+        : sr.every === 'quarter' ? 'every 3 months' : 'once a year (' + Utilities.formatDate(dt_(lastO.date), X.tz, 'd MMM') + ')';
+      // stopped part-way through the year? (e.g. a loan that was paid off) → listed, but left off
+      const gap = sr.days || (sr.every === 'month' ? 31 : sr.every === 'quarter' ? 92 : 366);
+      const stopped = sr.every !== 'year' && daysApart_(lastO.date, sTo) > 2 * gap + 3;
+      const lastTxt = Utilities.formatDate(dt_(lastO.date), X.tz, 'd MMM');
+      plan.push({ key: k, name: g.name || colName.trim(), named: !!g.name, col: g.col, colName: colName.trim(), amt: lastO.amt, terms: lastO.terms,
+        every: sr.every, when: when + (stopped ? ' \u00b7 stopped ' + lastTxt : ''), count: ds.length, already: already, dates: ds, last: lastO.date,
+        slot: g.col + '|' + sr.every + '|' + (sr.days ? dowOf_(lastO.date) : (sr.dom || sr.md || '')),
+        pick: sr.every !== 'year' && g.occ.length >= 3 && !stopped });
+    });
+    // an amount with no note that changed during the year (e.g. savings $1,200 → $1,800): keep only the newest one
+    const newest = {};
+    plan.forEach(x => { if (x.named) return; if (!newest[x.slot] || newest[x.slot].last < x.last) newest[x.slot] = x; });
+    plan.forEach(x => { if (!x.named && newest[x.slot] !== x && x.pick) { x.pick = false; x.when += ' \u00b7 replaced by ' + noteAmt_(newest[x.slot].amt); } });
+    const myRep = repeatsOut_(ctx).filter(r => r.tab === X.sh.getName() && r.endMode === 'sheet');
+    const repNames = {}; myRep.forEach(r => { repNames[r.name.toLowerCase() + '|' + r.col] = 1; });
+    plan.forEach(x => { if (x.named && repNames[x.name.toLowerCase() + '|' + x.col]) { x.pick = false; x.when += ' \u00b7 already a repeating bill'; } });
+    plan.sort((a, b) => (b.pick - a.pick) || (b.amt * b.count - a.amt * a.count));
+    if (p.dryRun) return { year: year, items: plan.map(x => { const y = Object.assign({}, x); y.first = x.dates[0] || ''; delete y.dates; return y; }) };
+    // write it
+    const pick = {}; (p.keys || []).forEach(k => { pick[k] = true; });
+    const byRow = {};
+    plan.filter(x => pick[x.key]).forEach(x => x.dates.forEach(d => { (byRow[d] = byRow[d] || []).push(x); }));
+    const tRows = rows.filter(rw => rw.date >= tFrom && rw.date <= tTo);
+    if (!tRows.length) throw new Error('No rows for ' + year);
+    const r0 = tRows[0].r, nR = tRows[tRows.length - 1].r - r0 + 1, styles = {};
+    const colsOut = {}; L.amounts.concat(L.notes).forEach(c => { colsOut[c.i] = null; });
+    let added = 0;
+    const cellOut = (rw, ci) => rw.f[ci] ? rw.f[ci] : rw.v[ci];
+    L.amounts.forEach(a => { colsOut[a.i] = tRows.map(rw => [cellOut(rw, a.i)]); });
+    L.notes.forEach(nt => { colsOut[nt.i] = tRows.map(rw => [rw.v[nt.i]]); });
+    tRows.forEach((rw, idx) => {
+      const its = byRow[rw.date]; if (!its) return;
+      its.forEach(x => {
+        const a = L.amounts.filter(c => c.i === x.col)[0]; if (!a) return;
+        const pm = parseMoney_(rw.f[a.i], rw.v[a.i]) || { style: null, terms: [] };
+        const cur = colsOut[a.i][idx][0];
+        const pm2 = typeof cur === 'string' && cur.charAt(0) === '=' ? parseMoney_(cur, '') : (cur === '' || cur == null ? { style: null, terms: [] } : parseMoney_('', cur));
+        const use = pm2 || pm; if (!use) return;
+        x.terms.forEach(t => use.terms.push(t));
+        if (!use.style && use.terms.length > 1) use.style = styles[a.i] || (styles[a.i] = colStyle_(X.sh, X.hi, a.i));
+        colsOut[a.i][idx][0] = buildMoney_(use.style, use.terms);
+        if (x.named && a.note !== -1) {
+          let note = String(colsOut[a.note][idx][0] || '').replace(/\s+$/, '');
+          const expr = x.terms.map(noteAmt_).join('+');
+          const re = new RegExp('(^|/\\s*)(' + escRe_(x.name) + ')\\s*\\(([^)]*)\\)', 'i');
+          note = re.test(note) ? note.replace(re, (m, pre, nm, inner) => pre + nm + ' (' + inner + '+' + expr + ')') : (note ? note + ' / ' : '') + x.name + ' (' + expr + ')';
+          colsOut[a.note][idx][0] = note;
+        }
+        added++;
+      });
+    });
+    Object.keys(colsOut).forEach(ci => { if (colsOut[ci]) X.sh.getRange(r0, +ci + 1, nR, 1).setValues(colsOut[ci]); });
+    SpreadsheetApp.flush();
+    lock.releaseLock();
+    // repeating bills with no end date carry on into the new year
+    try {
+      const X2 = ledgerFor_(ctx, p.tab), ents = [];
+      myRep.forEach(r => rptDates(r.rule, r.start, tTo, 800).filter(d => d >= tFrom).forEach(d => ents.push({ date: d, col: r.col, name: r.name, terms: [r.amt] })));
+      if (ents.length) { const lk = LockService.getDocumentLock(); lk.waitLock(25000); try { added += addEntries_(X2, ents); } finally { lk.releaseLock(); } }
+    } catch (e) {}
+    try { if (wk.length) weekendFix_(ctx, {}); } catch (e) {}
+    return { year: year, added: added };
+  } finally { try { lock.releaseLock(); } catch (e) {} }
+}
+function ordinal_(n) { return (n % 100 >= 11 && n % 100 <= 13) ? 'th' : ({ 1: 'st', 2: 'nd', 3: 'rd' }[n % 10] || 'th'); }
+
+
+/* ============================ REPEATING BILLS ============================ */
+/** Repeating dates. rule: {unit:'day'|'week'|'month'|'year', every:n, mode:'date'|'nth', nth:1-5 (5 = last), wd:0-6, wkday:true/false, dir:'after'|'before'} */
+function rptDates(rule, start, until, maxN) {
+  var out = [], n = Math.max(1, parseInt(rule.every, 10) || 1), cap = Math.max(1, Math.min(maxN || 800, 800));
+  function pd(s) { var m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(String(s)); return new Date(+m[1], +m[2] - 1, +m[3], 12); }
+  function fd(d) { return d.getFullYear() + '-' + ('0' + (d.getMonth() + 1)).slice(-2) + '-' + ('0' + d.getDate()).slice(-2); }
+  function nthWd(yy, mm, nth, wd) {
+    if (nth >= 5) { var last = new Date(yy, mm + 1, 0, 12); while (last.getDay() !== wd) last.setDate(last.getDate() - 1); return last; }
+    var f = new Date(yy, mm, 1, 12); while (f.getDay() !== wd) f.setDate(f.getDate() + 1); f.setDate(f.getDate() + 7 * (nth - 1)); return f;
+  }
+  if (!/^\d{4}-\d{2}-\d{2}$/.test(String(start))) return out;
+  var s = pd(start), d, ds, i;
+  for (i = 0; out.length < cap && i < 3000; i++) {
+    if (rule.unit === 'day' || rule.unit === 'week') { d = new Date(s); d.setDate(s.getDate() + i * n * (rule.unit === 'week' ? 7 : 1)); }
+    else if (rule.unit === 'month') {
+      var mo = s.getMonth() + i * n, yy = s.getFullYear() + Math.floor(mo / 12), mm = ((mo % 12) + 12) % 12;
+      if (rule.mode === 'nth') d = nthWd(yy, mm, +rule.nth || 1, +rule.wd || 0);
+      else d = new Date(yy, mm, Math.min(s.getDate(), new Date(yy, mm + 1, 0).getDate()), 12);
+    } else { var y2 = s.getFullYear() + i * n; d = new Date(y2, s.getMonth(), Math.min(s.getDate(), new Date(y2, s.getMonth() + 1, 0).getDate()), 12); }
+    ds = fd(d);
+    if (until && ds > until) break;
+    if (ds < start) continue;
+    if (rule.wkday) { var w = d.getDay(); if (w === 6 || w === 0) { var dd = new Date(d); dd.setDate(d.getDate() + (rule.dir === 'before' ? (w === 6 ? -1 : -2) : (w === 6 ? 2 : 1))); ds = fd(dd); } }
+    if (out.indexOf(ds) < 0) out.push(ds);
+  }
+  return out;
+}
+
+function repeatsGet_() { try { return JSON.parse(PropertiesService.getScriptProperties().getProperty('repeats') || '[]'); } catch (e) { return []; } }
+function repeatsPut_(a) { PropertiesService.getScriptProperties().setProperty('repeats', JSON.stringify(a)); }
+/** Repeats with the sheet's current name (follows renames by tab ID). */
+function repeatsOut_(ctx) {
+  const byId = {}; ctx.s.tabs.forEach(t => { byId[t.id] = t.name; });
+  return repeatsGet_().map(r => { const o = Object.assign({}, r); if (r.tabId && byId[r.tabId]) o.tab = byId[r.tabId]; return o; });
+}
+function lastDate_(X) {
+  let last = X.sh.getLastRow();
+  while (last > X.hi.headerRow) { const v = X.sh.getRange(last, X.L.date + 1).getValue(); if (v instanceof Date) return ymdOf_(v, X.tz); last--; }
+  return '';
+}
+/** Adds entries [{date, col, name, terms}] in your usual format. Skips any day that already has the same item. */
+function addEntries_(X, entries) {
+  if (!entries.length) return 0;
+  const first = X.hi.headerRow + 1, rows = readBlock_(X, first, X.hi.lastRow - X.hi.headerRow), L = X.L;
+  const byDate = {}; rows.forEach((rw, i) => { if (rw.date) byDate[rw.date] = i; });
+  const touched = {}, styles = {}; let added = 0;
+  entries.forEach(e => {
+    const i = byDate[e.date]; if (i == null) return;
+    const rw = rows[i], a = L.amounts.filter(c => c.i === e.col)[0]; if (!a) return;
+    const amt = r2_(e.terms.reduce((x, y) => x + y, 0));
+    const items = rowItems_(L, rw.pms, rw.notes);
+    if (items.some(it => it.col === e.col && Math.abs(it.amt - amt) < 0.005 && (!e.name || it.name.toLowerCase() === e.name.toLowerCase()))) return;
+    let pm = rw.pms[a.i];
+    if (!pm) { if (rw.f[a.i] || String(rw.v[a.i]) !== '') return; pm = { style: null, terms: [] }; }
+    e.terms.forEach(t => pm.terms.push(t));
+    if (!pm.style && pm.terms.length > 1) pm.style = styles[a.i] || (styles[a.i] = colStyle_(X.sh, X.hi, a.i));
+    rw.pms[a.i] = pm; (touched[a.i] = touched[a.i] || {})[i] = 1;
+    if (e.name && a.note !== -1) {
+      let note = String(rw.notes[a.note] || '').replace(/\s+$/, '');
+      const expr = e.terms.map(noteAmt_).join('+');
+      const re = new RegExp('(^|/\\s*)(' + escRe_(e.name) + ')\\s*\\(([^)]*)\\)', 'i');
+      note = re.test(note) ? note.replace(re, (m, pre, nm, inner) => pre + nm + ' (' + inner + '+' + expr + ')') : (note ? note + ' / ' : '') + e.name + ' (' + expr + ')';
+      rw.notes[a.note] = note; (touched[a.note] = touched[a.note] || {})[i] = 1;
+    }
+    added++;
+  });
+  // one write per column, covering just the rows that changed
+  Object.keys(touched).forEach(ck => {
+    const ci = +ck, idx = Object.keys(touched[ck]).map(Number), lo = Math.min.apply(null, idx), hi = Math.max.apply(null, idx);
+    const isNote = L.notes.some(n => n.i === ci), out = [];
+    for (let i = lo; i <= hi; i++) {
+      const rw = rows[i];
+      if (!touched[ck][i]) out.push([rw.f[ci] ? rw.f[ci] : rw.v[ci]]);
+      else if (isNote) out.push([rw.notes[ci]]);
+      else { const b = buildMoney_(rw.pms[ci].style, rw.pms[ci].terms); out.push([b]); }
+    }
+    X.sh.getRange(rows[lo].r, ci + 1, hi - lo + 1, 1).setValues(out);
+  });
+  SpreadsheetApp.flush();
+  return added;
+}
+function repeatClean_(ctx, r) {
+  const X = ledgerFor_(ctx, r.tab);
+  const col = X.L.amounts.filter(a => a.i === Number(r.col))[0]; if (!col) throw new Error('Pick a column');
+  const name = tidyName_(r.name || ''); if (!name) throw new Error('Give it a name (it goes in the notes)');
+  const amt = r2_(r.amt); if (!(amt > 0)) throw new Error('Enter the amount');
+  dt_(r.start);
+  const rule = { unit: ['day', 'week', 'month', 'year'].indexOf(r.rule && r.rule.unit) >= 0 ? r.rule.unit : 'week', every: Math.max(1, Math.min(52, parseInt(r.rule && r.rule.every, 10) || 1)),
+    mode: r.rule && r.rule.mode === 'nth' ? 'nth' : 'date', nth: parseInt(r.rule && r.rule.nth, 10) || 1, wd: parseInt(r.rule && r.rule.wd, 10) || 0,
+    wkday: !!(r.rule && r.rule.wkday), dir: r.rule && r.rule.dir === 'before' ? 'before' : 'after' };
+  const endMode = ['sheet', 'date', 'count'].indexOf(r.endMode) >= 0 ? r.endMode : 'sheet';
+  const tabId = String(X.sh.getSheetId());
+  return { X: X, col: col, s: { id: r.id || '', tab: X.sh.getName(), tabId: tabId, col: col.i, colName: col.name, name: name, amt: amt, start: r.start, rule: rule,
+    endMode: endMode, until: endMode === 'date' ? String(r.until || '') : '', count: endMode === 'count' ? Math.max(1, Math.min(500, parseInt(r.count, 10) || 1)) : 0 } };
+}
+function repeatDatesFor_(X, s, from) {
+  const end = lastDate_(X);
+  const until = s.endMode === 'date' && s.until ? s.until : end;
+  let ds = rptDates(s.rule, s.start, until, s.endMode === 'count' ? s.count : 800);
+  return { all: ds, dates: ds.filter(d => d >= from), until: until, end: end };
+}
+function removeOcc_(ctx, s, from) {
+  try { return bulkChange_(ctx, { tab: s.tab, col: s.col, oldAmt: s.amt, remove: true, from: from, name: s.name }).count; }
+  catch (e) { if (/No days|Enter/.test(String(e.message))) return 0; throw e; }
+}
+function repeatSave_(ctx, p) {
+  requireEdit_(ctx);
+  const c = repeatClean_(ctx, p.series || {}), s = c.s;
+  const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone(), today = ymdOf_(new Date(), tz);
+  const all = repeatsGet_(), old = s.id ? all.filter(x => x.id === s.id)[0] : null;
+  const from = String(p.from || '') || (old ? (s.start > today ? s.start : today) : s.start);
+  let info = repeatDatesFor_(c.X, s, from);
+  if (p.dryRun) return { dates: info.dates, count: info.dates.length, until: info.until, end: info.end };
+  // a date past the end of the sheet: add the days first (up to 3 years ahead)
+  if (s.endMode === 'date' && s.until > info.end) {
+    const cap = plusDays_(today, 1100), to = s.until < cap ? s.until : cap;
+    const lock = LockService.getDocumentLock(); lock.waitLock(25000);
+    try { extendRows_(c.X.sh, c.X.hi, c.X.L, to, c.X.tz); } finally { lock.releaseLock(); }
+  }
+  let removed = 0;
+  if (old) removed = removeOcc_(ctx, old, from);
+  else if (p.replace) removed = removeOcc_(ctx, s, from);
+  const X = ledgerFor_(ctx, s.tab);
+  info = repeatDatesFor_(X, s, from);
+  const lock = LockService.getDocumentLock(); lock.waitLock(25000);
+  let added = 0;
+  try { added = addEntries_(X, info.dates.map(d => ({ date: d, col: s.col, name: s.name, terms: [s.amt] }))); }
+  finally { lock.releaseLock(); }
+  if (!s.id) s.id = Utilities.getUuid().slice(0, 8);
+  s.updated = today;
+  const next = all.filter(x => x.id !== s.id); next.push(s); repeatsPut_(next);
+  return { added: added, removed: removed, series: s, items: repeatsOut_(auth_()) };
+}
+function repeatDelete_(ctx, p) {
+  requireEdit_(ctx);
+  const all = repeatsGet_(), s = all.filter(x => x.id === p.id)[0]; if (!s) throw new Error('That repeat no longer exists');
+  const tz = SpreadsheetApp.getActive().getSpreadsheetTimeZone();
+  const cur = repeatsOut_(ctx).filter(x => x.id === p.id)[0] || s;
+  let removed = 0;
+  if (p.removeFuture !== false) removed = removeOcc_(ctx, cur, String(p.from || '') || ymdOf_(new Date(), tz));
+  repeatsPut_(all.filter(x => x.id !== p.id));
+  return { removed: removed, items: repeatsOut_(auth_()) };
+}
+
+
+/* ---------------- give an unnamed amount a name in the notes ---------------- */
+function nameAmount_(ctx, p) {
+  requireEdit_(ctx);
+  const X = ledgerFor_(ctx, p.tab), L = X.L;
+  const col = L.amounts.filter(a => a.i === Number(p.col))[0]; if (!col) throw new Error('Pick a column');
+  if (col.note === -1) throw new Error('That column has no notes column beside it');
+  const name = tidyName_(p.name || ''); if (!name) throw new Error('Type a name');
+  const amt = r2_(p.amt); if (!(amt > 0)) throw new Error('No amount');
+  const from = String(p.from || '');
+  const lock = LockService.getDocumentLock(); lock.waitLock(20000);
+  try {
+    const first = X.hi.headerRow + 1, rows = readBlock_(X, first, X.hi.lastRow - X.hi.headerRow), hits = [];
+    rows.forEach((rw, i) => {
+      if (!rw.date) return;
+      if (p.all ? rw.date < from : rw.r !== Number(p.row)) return;
+      const items = rowItems_(L, rw.pms, rw.notes);
+      if (!items.some(it => !it.name && it.col === col.i && Math.abs(it.amt - amt) < 0.005)) return;
+      hits.push(i);
+    });
+    if (p.dryRun || !hits.length) return { count: hits.length, dates: hits.map(i => rows[i].date) };
+    const lo = Math.min.apply(null, hits), hi = Math.max.apply(null, hits), out = [];
+    for (let i = lo; i <= hi; i++) {
+      let note = rows[i].v[col.note];
+      if (hits.indexOf(i) >= 0) { const cur = String(note || '').replace(/\s+$/, ''); note = (cur ? cur + ' / ' : '') + name + ' (' + noteAmt_(amt) + ')'; }
+      out.push([note]);
+    }
+    X.sh.getRange(rows[lo].r, col.note + 1, hi - lo + 1, 1).setValues(out);
+    SpreadsheetApp.flush();
+    return { count: hits.length, dates: hits.map(i => rows[i].date) };
+  } finally { lock.releaseLock(); }
 }
