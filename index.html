@@ -1166,22 +1166,36 @@ function curTab(){ var t=tabByName(S.acct);
 function runName(tab){ return short(tab.headers[tab.layout.run]); }
 function todayDay(tab){ var t=S.data.today, best=null; tab.days.forEach(function(d){ if(d.date<=t) best=d; }); return best||tab.days[0]; }
 function dayItems(tab, day){
-  var L=tab.layout, items=[], covered={};
+  var L=tab.layout, items=[], rem={};
+  /* every amount in each column, e.g. =(850+20) → [850, 20] */
+  L.amounts.forEach(function(a){ var pm=parseMoney(day.raw?day.raw[a.i]:''); var v=num(day.d[a.i]);
+    rem[a.i]=pm&&pm.terms.length?pm.terms.slice():(v?[v]:[]); });
+  function take(cols, amt, parts){
+    for(var c=0;c<cols.length;c++){ var r=rem[cols[c].i], k=-1;
+      for(var q=0;q<r.length;q++) if(Math.abs(r[q]-amt)<0.005){ k=q; break; }
+      if(k>=0){ r.splice(k,1); return cols[c]; }
+      if(parts&&parts.length>1){ var used=[], ok=true;
+        parts.forEach(function(x){ var j=-1; for(var q=0;q<r.length;q++) if(used.indexOf(q)<0&&Math.abs(r[q]-x)<0.005){ j=q; break; } if(j<0) ok=false; else used.push(j); });
+        if(ok){ used.sort(function(a,b){return b-a;}).forEach(function(q){ r.splice(q,1); }); return cols[c]; } }
+    }
+    return null; }
   L.notes.forEach(function(nt){
     var parts=splitNote(day.d[nt.i]); if(!parts.length) return;
     var cols=L.amounts.filter(function(a){return a.note===nt.i;});
-    var filled=cols.filter(function(a){return num(day.d[a.i])!==0;});
-    var parsed=parts.map(parseItem), withAmt=parsed.filter(function(p){return p.amt!==null;}).length;
-    parsed.forEach(function(p){
-      var kind='out', col=null;
-      if(p.amt!==null){ var inc=filled.filter(function(a){return a.kind==='in'&&Math.abs(num(day.d[a.i])-p.amt)<0.005;})[0]; if(inc){kind='in';col=inc;} }
-      else if(parsed.length===1&&filled.length===1){ p.amt=num(day.d[filled[0].i]); col=filled[0]; kind=col.kind==='in'?'in':'out'; }
-      if(!col && filled.length===1) col=filled[0];
-      items.push({name:p.name, amt:p.amt, kind:kind, col:col?col.name:null, note:nt.i, fromNote:p.amt!==null, r:day.r, date:day.date});
+    var filled=cols.filter(function(a){return rem[a.i].length;});
+    var parsed=parts.map(parseItem);
+    parsed.forEach(function(p,pi){
+      var col=null;
+      if(p.amt!==null){ var m=/\(([^()]*)\)\s*$/.exec(parts[pi]), sub=m?m[1].split('+').map(function(x){return parseFloat(x);}).filter(function(x){return !isNaN(x);}):[];
+        /* money-in columns first when the amount matches one, then spending */
+        col=take(cols.filter(function(a){return a.kind==='in';}),p.amt,sub)||take(cols.filter(function(a){return a.kind!=='in';}),p.amt,sub); }
+      else if(parsed.length===1&&filled.length===1){ col=filled[0]; p.amt=rem[col.i].reduce(function(x,y){return x+y;},0); rem[col.i]=[]; }
+      items.push({name:p.name, amt:p.amt, kind:col&&col.kind==='in'?'in':'out', col:col?col.name:(filled.length===1?filled[0].name:null), note:nt.i, fromNote:p.amt!==null, r:day.r, date:day.date});
     });
-    if(withAmt||parsed.length===1) filled.forEach(function(a){covered[a.i]=1;});
   });
-  L.amounts.forEach(function(a){ if(covered[a.i]) return; var v=num(day.d[a.i]); if(!v) return; items.push({name:short(a.name), amt:v, kind:a.kind==='in'?'in':'out', col:a.name}); });
+  /* whatever is left has no name in the notes: show it anyway, as money in or out by its column */
+  L.amounts.forEach(function(a){ var left=rem[a.i].filter(function(x){return Math.abs(x)>=0.005;}); if(!left.length) return;
+    left.forEach(function(v){ items.push({name:short(a.name), amt:Math.abs(v), kind:a.kind==='in'?'in':'out', col:a.name, colIdx:a.i, unnamed:true, r:day.r, date:day.date}); }); });
   return items;
 }
 /* Same colour bands as the sheet's conditional formatting */
@@ -1439,9 +1453,14 @@ function gameTile(){
   return '<button class="gametile" onclick="Game.open()"><span class="gt-cards"><i class="g1">7</i><i class="g2">\u21C4</i><i class="g3">+2</i><i class="g4">\u2605</i></span>'
     +'<span class="gt-txt"><small>Card game \u00b7 1 v 1</small><b>Last Card</b><span>vs the Goose \u00b7 You '+sc.me+' \u2013 '+sc.cpu+'</span></span><span class="gt-play">PLAY</span></button>';
 }
+function itemTap(i, tab, inSheet){
+  var pre=inSheet?'closeSheet();setTimeout(function(){':'', post=inSheet?'},280)':'';
+  if(i.fromNote) return '<button style="display:block;width:100%;text-align:left" onclick="'+pre+'openItem(\''+jsq(tab.name)+'\','+i.r+','+i.note+',\''+jsq(i.name)+'\','+i.amt+')'+post+'">'+txRow(i,tab)+'</button>';
+  if(i.unnamed) return '<button style="display:block;width:100%;text-align:left" onclick="'+pre+'openUnnamed(\''+jsq(tab.name)+'\','+i.r+','+i.colIdx+','+i.amt+')'+post+'">'+txRow(i,tab)+'</button>';
+  return txRow(i,tab); }
 function txRow(it, tab){
   var amt=it.amt==null?'':(it.kind==='in'?'+':'\u2212')+money(it.amt,tab);
-  var bn=brandName(it.name), sub=(bn?bn+' \u00b7 ':'')+(it.kind==='in'?'Money in':(it.col?short(it.col):'Spent'));
+  var bn=brandName(it.name), sub=it.unnamed?(it.kind==='in'?'Money in':'Money out')+' \u00b7 no name in the notes':(bn?bn+' \u00b7 ':'')+(it.kind==='in'?'Money in':(it.col?short(it.col):'Spent'));
   return '<div class="tx">'+logoHtml(it.name,it.kind)+'<span class="nm">'+esc(it.name)+'<small>'+esc(sub)+'</small></span><span class="amt '+(it.kind==='in'?'in':'')+'">'+amt+'</span></div>';
 }
 function activityHtml(tab, maxDays){
@@ -1511,7 +1530,7 @@ function viewAhead(tab, tabs){
   if(!withItems.length) h+='<div class="card empty">Nothing planned in this range.</div>';
   withItems.slice(0,60).forEach(function(x){ var it=dayItems(tab,x), tt=dayTotals(tab,x), rr=cfFor(tab,tab.layout.run,x.d[tab.layout.run]);
     h+='<div class="dayhdr"><span>'+esc(dayLabel(x.date))+'</span><span class="cfpill sm" style="'+(rr?cfStyle(rr):'')+'">'+esc(x.d[tab.layout.run])+'</span></div><div class="card">'
-      +it.map(function(i){ return i.fromNote?'<button style="display:block;width:100%;text-align:left" onclick="openItem(\''+jsq(tab.name)+'\','+i.r+','+i.note+',\''+jsq(i.name)+'\','+i.amt+')">'+txRow(i,tab)+'</button>':txRow(i,tab); }).join('')+'</div>'; });
+      +it.map(function(i){ return itemTap(i,tab,false); }).join('')+'</div>'; });
   $('view').innerHTML=h;
 }
 function aheadChart(tab, from, to){
@@ -1834,6 +1853,35 @@ function pickTab(){ var t=curTab(); return t&&t.kind==='ledger'?t:ledgers()[0]; 
 function swBtn(id,label,sub,on){ return '<button class="toggle" style="width:100%;margin-top:10px" id="'+id+'" onclick="this.querySelector(\'.sw\').classList.toggle(\'on\')"><span style="text-align:left">'+label+(sub?'<small style="display:block;color:var(--ink3);font-weight:400;font-size:12px">'+sub+'</small>':'')+'</span><span class="sw'+(on?' on':'')+'"></span></button>'; }
 function isOn(id){ var e=$(id); return !!(e&&e.querySelector('.sw').classList.contains('on')); }
 
+
+/* --- an amount with no name in the notes: give it one --- */
+var UN=null, UNT=null;
+function openUnnamed(tabName, r, colIdx, amt){
+  var tab=tabByName(tabName), day=tab.days.filter(function(d){return d.r===r;})[0], col=tab.layout.amounts.filter(function(a){return a.i===colIdx;})[0]; if(!day||!col) return;
+  UN={tab:tabName,r:r,col:colIdx,amt:amt,date:day.date,mode:'all',from:day.date};
+  var it={name:short(col.name),amt:amt,kind:col.kind==='in'?'in':'out',col:col.name,unnamed:true};
+  openSheet(sheetHead('Name this amount')
+   +'<div class="card">'+txRow(it,tab)+'</div>'
+   +'<p class="note" style="margin:10px 4px 6px">This '+money(amt,tab)+' is in <b>'+esc(short(col.name))+'</b> on '+esc(dayLabel(day.date))+' but has no name in the notes, so the app can only call it \u201C'+esc(short(col.name))+'\u201D. Give it a name and it\u2019s added to the notes in your usual format. The amount itself doesn\u2019t change.</p>'
+   +(col.note===-1?'<div class="writes">This column has no notes column beside it, so a name can\u2019t be added.</div></div><div class="ft"></div>':
+     fieldIn('un_name','Name',col.kind==='in'?'':'','placeholder="'+(col.kind==='in'?'e.g. Paul Spending Money':'e.g. Transfer to Spending')+'" autocomplete="off" autocapitalize="words" oninput="unPrev()"')
+   +'<div class="lbl2">Which ones?</div><div class="toggle2"><button onclick="UN.mode=\'one\';unMode(this)">Just this day</button><button class="on" onclick="UN.mode=\'all\';unMode(this)">Every '+money(amt,tab)+' here</button></div>'
+   +'<div id="un_fromBox">'+fieldIn('un_from','From',day.date,'type="date" onchange="UN.from=this.value||UN.date;unPrev()"')+'</div>'
+   +'<div class="writes" id="un_prev">Type a name to see what changes.</div></div>'
+   +'<div class="ft"><button class="btn" id="unBtn" onclick="unSave()" disabled>Add the name</button></div>'));
+}
+function unMode(b){ document.querySelectorAll('#sheet .toggle2 button').forEach(function(x){ x.classList.toggle('on',x===b); }); $('un_fromBox').style.display=UN.mode==='all'?'':'none'; unPrev(); }
+function unParams(dry){ return {tab:UN.tab,col:UN.col,amt:UN.amt,name:tidyName($('un_name').value),row:UN.r,all:UN.mode==='all',from:UN.from,dryRun:dry}; }
+function unPrev(){ clearTimeout(UNT); var p=unParams(true), b=$('unBtn'), t=tabByName(UN.tab); if(b) b.disabled=true;
+  if(!p.name){ $('un_prev').textContent='Type a name to see what changes.'; return; }
+  if(!p.all){ $('un_prev').innerHTML='Adds <code>'+esc(p.name)+' ('+noteAmt(p.amt)+')</code> to the note on '+esc(dayLabel(UN.date))+'.'; if(b) b.disabled=false; return; }
+  $('un_prev').textContent='Checking the sheet\u2026';
+  UNT=setTimeout(function(){ call('nameAmount',p).then(function(r){ if(!$('un_prev')) return;
+    $('un_prev').innerHTML=r.count?'Adds <code>'+esc(p.name)+' ('+noteAmt(p.amt)+')</code> to the note on <b>'+r.count+' day'+(r.count===1?'':'s')+'</b>: '+esc(r.dates.slice(0,5).map(dayLabel).join(', '))+(r.count>5?'\u2026':'')+'. Only days where this amount has no name yet.':'No unnamed '+money(p.amt,t)+' from that date.'; if($('unBtn')) $('unBtn').disabled=!r.count; })
+   .catch(function(e){ if($('un_prev')) $('un_prev').textContent=cleanErr(e); }); },400); }
+function unSave(){ busy('unBtn','Adding\u2026');
+  call('nameAmount',unParams(false)).then(function(r){ closeSheet(); toast('Named '+r.count+' day'+(r.count===1?'':'s')); boot(); }).catch(function(e){ unbusy('unBtn'); toast(cleanErr(e)); }); }
+
 /* --- new sheet --- */
 function openNewTab(){
   if(!ledgers().length){ toast('Switch on a daily sheet first, so the new one can copy its layout'); return; }
@@ -2061,7 +2109,7 @@ function openDay(tabName, r){
   var tab=tabByName(tabName), day=tab.days.filter(function(d){return d.r===r;})[0]; if(!day) return;
   D={tab:tabName, r:r}; var L=tab.layout, canEdit=S.data.canEdit, h='';
   h+='<div class="hd"><button onclick="closeSheet()">Close</button><b>'+esc(dayLabel(day.date))+'</b><span></span></div><div class="bd">';
-  h+='<div class="card">'+dayItems(tab,day).map(function(it){ return it.fromNote?'<button style="display:block;width:100%;text-align:left" onclick="closeSheet();setTimeout(function(){openItem(\''+jsq(tab.name)+'\','+it.r+','+it.note+',\''+jsq(it.name)+'\','+it.amt+')},280)">'+txRow(it,tab)+'</button>':txRow(it,tab); }).join('')
+  h+='<div class="card">'+dayItems(tab,day).map(function(it){ return itemTap(it,tab,true); }).join('')
     +'<div class="tx" style="color:var(--ink3)"><span class="nm">'+esc(runName(tab))+'</span><span class="amt" style="color:var(--ink)">'+esc(day.d[L.run])+'</span></div></div>';
   if(canEdit){
     h+='<div class="lbl2">Fix this day (exactly as it is in the sheet)</div>';
@@ -2303,6 +2351,9 @@ var Mock=(function(){
     if(action==='bulkChange'){ var ds=t.days.filter(function(d){ return d.date>=p.from&&(!p.to||d.date<=p.to)&&Math.abs(num(d.d[p.col])-p.oldAmt)<0.005; }).map(function(d){return d.date;}); return {count:ds.length,dates:ds}; }
     if(action==='planYear'){ return {year:p.year,added:0,items:p.dryRun?[{key:'a',name:'Car Loan',named:true,amt:110,when:'every week on Sundays',count:52,already:0,pick:true},{key:'b',name:'Income Amount',named:false,amt:3623.69,when:'every fortnight on Fridays',count:26,already:0,pick:true},{key:'c',name:'Paul Car Insurance',named:true,amt:147.02,when:'monthly on the 7th',count:12,already:0,pick:true},{key:'d',name:'Paul Rego',named:true,amt:242.46,when:'once a year (24 Oct)',count:1,already:0,pick:false}]:[]}; }
     if(action==='repeatList') return {items:cfg.repeats||[]};
+    if(action==='nameAmount'){ var nd=t.days.filter(function(d){ return (p.all?d.date>=p.from:d.r===p.row) && dayItems(t,d).some(function(i){ return i.unnamed&&i.colIdx===p.col&&Math.abs(i.amt-p.amt)<0.005; }); });
+      if(!p.dryRun){ var nc=t.layout.amounts.filter(function(a){return a.i===p.col;})[0].note; nd.forEach(function(d){ var cur=String(d.d[nc]||'').trim(); d.d[nc]=(cur?cur+' / ':'')+p.name+' ('+noteAmt(p.amt)+')'; if(d.raw) d.raw[nc]=d.d[nc]; }); }
+      return {count:nd.length,dates:nd.map(function(d){return d.date;})}; }
     if(action==='repeatSave'){ var sr=p.series, lt=t||ledgersAll.filter(function(x){return x.name===sr.tab;})[0], end=lt.days[lt.days.length-1].date, from=p.from||sr.start;
       var ds=rptDates(sr.rule,sr.start,sr.endMode==='date'?sr.until:end,sr.endMode==='count'?sr.count:800).filter(function(d){return d>=from;}), added=0;
       ds.forEach(function(d){ try{ Mock.api('addSpend','',{tab:sr.tab,date:d,col:+sr.col,amount:sr.amt,name:sr.name}); added++; }catch(e){} });
